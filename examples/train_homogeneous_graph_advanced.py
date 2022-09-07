@@ -18,11 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from secrets import choice
 from typing import List, Union, Dict
 from argparse import ArgumentParser
 import os
 import logging
 import time
+from matplotlib import pyplot as plt
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -32,7 +34,7 @@ import dgl  # type: ignore
 
 import sar
 from sar.core.compressor import \
-    FeatureCompressorDecompressor, NodeCompressorDecompressor
+    FeatureCompressorDecompressor, NodeCompressorDecompressor, SubgraphCompressorDecompressor
 from sar.config import Config
 
 
@@ -106,31 +108,36 @@ parser.add_argument('--n-layers', default=3, type=int,
 parser.add_argument('--layer-dim', default=256, type=int,
                     help='Dimension of GNN hidden layer')
 
-parser.add_argument('--compression_ratio_b', default=None, type=float, 
-                    help="Initial Compression ratio for client-wise compression channel-set")
-
-parser.add_argument('--compression_ratio_a', default=None, type=float, 
-                    help="Compression ratio slope for client-wise compression channel-set")
-
-parser.add_argument('--compression_step', default=None, type=int, 
-                    help="Number of training iteration after which compression ratio changes")
-
-parser.add_argument('--compression_type', default=None, type=str, 
-                    help="Compression type")
-
 parser.add_argument('--n_kernel', default=None, type=int,
                     help='Number of channels in the fixed compression channel-set')
 
-parser.add_argument('--log_dir', default="log/fed", type=str,
+parser.add_argument('--log_dir', default="log", type=str,
                     help='Parent directory for logging')
-
-parser.add_argument('--disable_cut_edges', action="store_true", 
-                    help="Stop embedding sharing between clients")
 
 parser.add_argument('--fed_agg_round', default=501, type=int, 
                     help='number of training iterations after \
                         which weights across clients will \
                             be aggregated')
+
+# Newly added arguments for compression decompression module
+parser.add_argument('--enable_cr', action='store_true', 
+                    default=False, help="Turn on compression before \
+                    sending to remote clients")
+                
+parser.add_argument('--comp_ratio', default=None, type=int, 
+                    help="Compression ratio for sub-graph based compression")
+
+parser.add_argument('--compression_type', default="feature", type=str, 
+                    choices=["feature", "node", "subgraph"], 
+                    help="Choose among three possible compression types")
+
+parser.add_argument('--enable_vcr', action='store_true', 
+                    default=False, help="Turn on variable compression ratio")
+
+parser.add_argument('--compression_step', default=None, type=int, 
+                    help="Number of training iteration after which compression ratio \
+                        changes for variable compression ratio")
+
 
 class GNNModel(nn.Module):
     def __init__(self,  gnn_layer: str, n_layers: int, layer_dim: int,
@@ -139,7 +146,6 @@ class GNNModel(nn.Module):
 
         assert n_layers >= 1, 'GNN must have at least one layer'
         dims = [input_feature_dim] + [layer_dim] * (n_layers-1) + [n_classes]
-        print(dims)
 
         self.convs = nn.ModuleList()
         for idx in range(len(dims) - 1):
@@ -157,7 +163,7 @@ class GNNModel(nn.Module):
                 raise ValueError(f'unknown gnn layer type {gnn_layer}')
             self.convs.append(layer)
 
-    def forward(self,  blocks: List[Union[sar.GraphShardManager, sar.DistributedBlock]],
+    def forward(self, blocks: List[Union[sar.GraphShardManager, sar.DistributedBlock]],
                 features: torch.Tensor):
         for idx, conv in enumerate(self.convs):
             Config.current_layer_index = idx
@@ -299,7 +305,11 @@ def main():
     use_gpu = torch.cuda.is_available() and not args.cpu_run
     Config.total_layers = args.n_layers
     Config.total_train_iter = args.train_iters
+    Config.enable_cr = args.enable_cr
+    Config.compression_type = args.compression_type
     Config.step = args.compression_step
+    Config.enable_vcr = args.enable_vcr
+    
     # Create log directory
     writer = SummaryWriter(f"{args.log_dir}/ogbn-arxiv/lr={args.lr}/n_clients={args.world_size}/rank={args.rank}")
 
@@ -375,19 +385,35 @@ def main():
     else:  # No MFGs. The same full graph in every layer
         full_graph_manager = sar.construct_full_graph(partition_data)
         if args.train_mode == 'one_shot_aggregation':
+            indices_required_from_me = full_graph_manager.indices_required_from_me
+            tgt_node_range = full_graph_manager.tgt_node_range
             full_graph_manager = full_graph_manager.get_full_partition_graph()
+            feature_dim = [features.size(1)] + [args.layer_dim] * (args.n_layers - 2) + [num_labels]
             if args.compression_type == "feature":
                 comp_mod = FeatureCompressorDecompressor(
-                        feature_dim=[features.size(1)] + [args.layer_dim] * (args.n_layers - 2) + [num_labels],
-                        comp_ratio= [float(args.compression_ratio_b)] * args.n_layers
+                        feature_dim=feature_dim,
+                        comp_ratio= [float(args.comp_ratio)] * args.n_layers
                     )
-            else:
+            elif args.compression_type == "node":
                 comp_mod = NodeCompressorDecompressor(
-                        feature_dim=[features.size(1)] + [args.layer_dim] * (args.n_layers - 2) + [num_labels],
-                        comp_ratio_b=[float(args.compression_ratio_b)] * args.n_layers,
-                        comp_ratio_a=[float(args.compression_ratio_a)] * args.n_layers,
-                        step=args.compression_step
+                        feature_dim=feature_dim,
+                        comp_ratio=args.comp_ratio,
+                        step=32,
+                        enable_vcr=True
                     )
+            elif args.compression_type == "subgraph":
+                comp_mod = SubgraphCompressorDecompressor(
+                        feature_dim=feature_dim,
+                        full_local_graph=full_graph_manager,
+                        indices_required_from_me=indices_required_from_me,
+                        tgt_node_range=tgt_node_range,
+                        comp_ratio=args.comp_ratio,
+                        step=32,
+                        enable_vcr=True
+                )
+            else:
+                raise NotImplementedError("Undefined compression_type." 
+                                            "Must be one of feature/node/subgraph")
             full_graph_manager._compression_decompression = comp_mod
 
         full_graph_manager = full_graph_manager.to(device)
@@ -424,8 +450,8 @@ def main():
     n_train_points = n_train_points.item()
 
     optimizer = torch.optim.Adam(gnn_model.parameters(), lr=args.lr)
-    best_val_acc = 0
-    model_acc = 0
+    best_val_acc = torch.Tensor(0)
+    model_acc = torch.Tensor(0)
     for train_iter_idx in range(args.train_iters):
         t_1 = time.time()
         Config.train_iter = train_iter_idx
@@ -448,9 +474,13 @@ def main():
                        masks,
                        labels,
                        args.construct_mfgs)
-        if val_acc >= best_val_acc:
+        if train_iter_idx == 0:
             best_val_acc = val_acc
             model_acc = test_acc
+        if (train_iter_idx + 1) % args.fed_agg_round == 0:
+            if val_acc >= best_val_acc:
+                best_val_acc = val_acc
+                model_acc = test_acc
         result_message = (
             f"iteration [{train_iter_idx}/{args.train_iters}] | "
         )
@@ -475,7 +505,13 @@ def main():
         writer.add_scalar("Accuracy/valid", val_acc.item(), train_iter_idx)
         writer.add_scalar("Accuracy/test", test_acc.item(), train_iter_idx)
         
+    with open("result.txt", "a") as f:
+        f.writelines("="*100 + "\n")
+        f.writelines(f"STEP={Config.step}\n")
+        f.writelines(f"final accuracy: {model_acc.item()}" + "\n")
+        f.writelines(f"Entropy: {Config.entropy}, MI: {sum(Config.mi_leak)}")
+        f.writelines("="*100 + "\n\n")
 
-
+    plt.plot(Config.mi_leak)
 if __name__ == '__main__':
     main()

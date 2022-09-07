@@ -56,3 +56,9 @@ class Config(object):
     total_layers: int = None
     train_iter: int = 0
     total_train_iter: int = 0
+    compression_type: str = None
+    mi_leak = []
+    entropy: float = 0
+    step: int = 32
+    enable_cr: bool = False
+    enable_vcr: bool = False

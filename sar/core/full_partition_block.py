@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from cgitb import enable
 from typing import List, Dict, Optional, Tuple
 import logging
 from collections.abc import MutableMapping
@@ -27,6 +28,9 @@ import dgl  # type: ignore
 from torch import Tensor
 import torch.distributed as dist
 from torch.autograd import profiler
+from sklearn.feature_selection import mutual_info_regression
+import numpy as np
+
 from sar.comm import exchange_tensors
 from sar.core.compressor import CompressorDecompressorBase
 
@@ -38,6 +42,17 @@ logger.addHandler(logging.NullHandler())
 logger.setLevel(logging.DEBUG)
 
 
+def compute_MI(X, Y):
+    """
+    Compute Mutual Information between two numpy arrays.
+    This will compute MI between each m_i = (X[:, i], Y[:, i]) and 
+    return the average of m_i for i = 0 to len(X)
+    """
+    mi = 0
+    for i in range(X.shape[1]):
+        val = mutual_info_regression(X[:, i][:, np.newaxis], Y[:, i], random_state=42)
+        mi += val.sum()
+    return mi
 
 class ProxyDataView(MutableMapping):
     """A distributed dictionary"""
@@ -62,24 +77,64 @@ class ProxyDataView(MutableMapping):
 
         with profiler.record_function("COMM_FETCH"):
             logger.debug(f'compression decompression: {rank()}')
-            compressed_send_tensors = self.dist_block.compression_decompression.compress(
-                [value[ind] for ind in self.indices_required_from_me], 
-                Config.train_iter, Config.step, 
-                vcr_type="exp", scorer_type="learnable")
-            if type(compressed_send_tensors) is tuple:
-                compressed_recv_tensors = []
-                for i in range(len(compressed_send_tensors)):
-                    compressed_recv_tensors.append(
-                        list(simple_exchange_op(*compressed_send_tensors[i])))
-                compressed_recv_tensors.append(self.sizes_expected_from_others)
-                compressed_recv_tensors = tuple(compressed_recv_tensors)
-            else:
-                compressed_recv_tensors = simple_exchange_op(*compressed_send_tensors)
-            recv_tensors = self.dist_block.compression_decompression.decompress(
-                compressed_recv_tensors)
-            recv_tensors[rank()] = value[self.indices_required_from_me[rank()]]
-            exchange_result = torch.cat(recv_tensors, dim=-2)
+            send_tensors = [value[ind] for ind in self.indices_required_from_me]
+            if Config.enable_cr:
+                compressed_send_tensors = self.dist_block.compression_decompression.compress(
+                                                    send_tensors, iter=Config.train_iter)
+                # =====================================================================
+                # Code for MI calculation. This part slows down the training significantly.
+                # So I am commenting it out.
+                # first decompress locally
+                # Compute mutual information for each feature dimension individually and
+                # average them. Sum them up over iterations.
+                # if Config.current_layer_index == 0 and Config.train_iter % 2 == 0:
+                #     X = [value[ind] for ind in self.indices_required_from_me]
+                #     with torch.no_grad():
+                #         # Decompress locally
+                #         if type(compressed_send_tensors) is tuple:
+                #             # subgraph based
+                #             sizes = [len(ind) for ind in self.indices_required_from_me]
+                #             Y = list(compressed_send_tensors)
+                #             Y.append(sizes)
+                #             Y = self.dist_block.compression_decompression.decompress(tuple(Y))
+                #         else:
+                #             # feature based
+                #             Y = self.dist_block.compression_decompression.decompress(compressed_send_tensors)
+                #     total_mi = 0
+                #     for i in range(0, len(X)):
+                #         if i == rank():
+                #             continue
+                #         total_mi += compute_MI(X[i].detach().cpu().numpy(), Y[i].detach().cpu().numpy())
+                    
+                #     if Config.train_iter == 0:
+                #         total_ent = 0
+                #         for i, x in enumerate(X):
+                #             if i == rank():
+                #                 continue
+                #             total_ent += compute_MI(x.detach().cpu().numpy(), x.detach().cpu().numpy())
+                #         Config.entropy += total_ent
+                #         print(f"Entropy: {Config.entropy}")
+                    
+                #     total_mi /= Config.entropy
+                #     Config.mi_leak.append(total_mi)
+                #     print(f"current_leak: {total_mi}, total_leak: {sum(Config.mi_leak)}")
+                # ==========================================================================
 
+                if type(compressed_send_tensors) is tuple:
+                    compressed_recv_tensors = []
+                    for i in range(len(compressed_send_tensors)):
+                        compressed_recv_tensors.append(
+                            list(simple_exchange_op(*compressed_send_tensors[i])))
+                    compressed_recv_tensors.append(self.sizes_expected_from_others)
+                    compressed_recv_tensors = tuple(compressed_recv_tensors)
+                else:
+                    compressed_recv_tensors = simple_exchange_op(*compressed_send_tensors)
+                recv_tensors = self.dist_block.compression_decompression.decompress(compressed_recv_tensors)
+                recv_tensors[rank()] = value[self.indices_required_from_me[rank()]]
+            else:
+                recv_tensors = simple_exchange_op(*send_tensors)
+            exchange_result = torch.cat(recv_tensors, dim=-2)
+        
         logger.debug(f'exchange_result {exchange_result.size()}')
 
         self.base_dict[key] = exchange_result
@@ -127,9 +182,6 @@ class DistributedBlock:
     :type seeds: Tensor
     :param edge_type_names: A list of edge type names 
     :type edge_type_names: List[str]
-    :param compressors: A list of learnable compressor modules for each remote client that compresses the outgoing
-    node features
-    :type compressors: List[nn.Module]
 
     """
 
