@@ -40,7 +40,7 @@ class CompressorDecompressorBase(nn.Module):
 
 
 class FeatureCompressorDecompressor(CompressorDecompressorBase):
-    def __init__(self, feature_dim: List[int], comp_ratio: List[float]):
+    def __init__(self, feature_dim: List[int], comp_ratio: List[float], batch_norm=True):
         """
         A feature-based compression decompression module. The compressor compresses outgoing
         tensor along feature dimension and decompresses it back to original size on the receiving
@@ -64,9 +64,15 @@ class FeatureCompressorDecompressor(CompressorDecompressorBase):
                 nn.Linear(f, k),
                 nn.ReLU()
             )
-            self.decompressors[f"layer_{i}"] = nn.Sequential(
-                nn.Linear(k, f)
-            )
+            if batch_norm:
+                self.decompressors[f"layer_{i}"] = nn.Sequential(
+                    nn.Linear(k, f),
+                    nn.BatchNorm1d(f)
+                )
+            else:
+                self.decompressors[f"layer_{i}"] = nn.Sequential(
+                    nn.Linear(k, f)
+                )
     
     def compress(self, tensors_l: List[Tensor], iter: int = 0, scorer_type=None):
         '''
@@ -411,6 +417,3 @@ class SubgraphCompressorDecompressor(CompressorDecompressorBase):
             decompressed_tensors_l.append(new_val)
 
         return decompressed_tensors_l
-    
-
-        

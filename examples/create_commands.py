@@ -5,7 +5,7 @@ cmd_vcr = []
 COMP_TYPE = "feature"
 
 TRAIN_ITER = 256
-COMP_RATIO = 2
+COMP_RATIO = 16
 STEP = TRAIN_ITER // COMP_RATIO
 
 LOG_DIR_FCR = f"log/fixed_cr/{COMP_TYPE}/CR={COMP_RATIO}/K={ROUND}"
@@ -18,7 +18,7 @@ for t in range(TRIALS):
     for i in range(N_CLIENTS):
         cmd_fcr += f"python3 train_homogeneous_graph_advanced.py --partitioning-json-file ../partition_data/ogbn-arxiv.json \
             --log_dir {LOG_DIR_FCR} --compression_type {COMP_TYPE} --comp_ratio {COMP_RATIO} --enable_cr --train-mode one_shot_aggregation --ip-file ip_file.txt --fed_agg_round {ROUND} --lr 1e-3 \
-                --train-iters {TRAIN_ITER} --rank {i} --world-size {N_CLIENTS} --backend ccl &\n"
+                --train-iters {TRAIN_ITER} --rank {i} --world-size {N_CLIENTS} --backend ccl --sync_compressor &\n"
         cmd_vcr += f"python3 train_homogeneous_graph_advanced.py --partitioning-json-file ../partition_data/ogbn-arxiv.json \
             --log_dir {LOG_DIR_VCR} --enable_cr --enable_vcr --compression_type {COMP_TYPE} --compression_step {STEP} --train-mode one_shot_aggregation --ip-file ip_file.txt --fed_agg_round {ROUND} --lr 1e-3 \
                 --train-iters {TRAIN_ITER} --rank {i} --world-size {N_CLIENTS} --backend ccl &\n"

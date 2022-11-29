@@ -149,6 +149,7 @@ class GNNModel(nn.Module):
         dims = [input_feature_dim] + [layer_dim] * (n_layers-1) + [n_classes]
 
         self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
         for idx in range(len(dims) - 1):
             if gnn_layer == 'gat':
                 # use 2 attention heads
@@ -165,12 +166,13 @@ class GNNModel(nn.Module):
             else:
                 raise ValueError(f'unknown gnn layer type {gnn_layer}')
             self.convs.append(layer)
-        #self.dropout = nn.Dropout(0.5)
+            self.bns.append(nn.BatchNorm1d(dims[idx]))
 
     def forward(self, blocks: List[Union[sar.GraphShardManager, sar.DistributedBlock]],
                 features: torch.Tensor):
         for idx, conv in enumerate(self.convs):
             Config.current_layer_index = idx
+            features = self.bns[idx](features)
             t1 = time.time()
             features = conv(blocks[idx], features)
             t2 = time.time() - t1
@@ -180,7 +182,7 @@ class GNNModel(nn.Module):
                 features = features.mean(1)
 
             if idx < len(self.convs) - 1:
-                features = F.relu(features, inplace=True)
+                features = F.relu(features)
                 #features = self.dropout(features)
 
         return features
