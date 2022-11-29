@@ -132,6 +132,9 @@ parser.add_argument('--compression_type', default="feature", type=str,
 parser.add_argument('--enable_vcr', action='store_true',
                     default=False, help="Turn on variable compression ratio")
 
+parser.add_argument('--sync_compressor', action='store_true',
+                    default=False, help="Synchronize compressor decompressor across clients")
+
 parser.add_argument('--compression_step', default=None, type=int,
                     help="Number of training iteration after which compression ratio \
                         changes for variable compression ratio")
@@ -250,7 +253,8 @@ def infer_pass(gnn_model: torch.nn.Module,
     return (train_loss, train_acc, val_loss, val_acc, test_loss, test_acc)
 
 
-def train_pass(gnn_model: torch.nn.Module,
+def train_pass(gnn_model: torch.nn.Module, 
+               comp_mod: torch.nn.Module,
                optimizer: torch.optim.Optimizer,
                train_blocks: List[Union[sar.GraphShardManager, sar.DistributedBlock]],
                features: torch.Tensor,
@@ -259,7 +263,8 @@ def train_pass(gnn_model: torch.nn.Module,
                n_train_points: int,
                mfg_blocks: bool,
                train_iter_idx: int,
-               fed_agg_round: int
+               fed_agg_round: int,
+               sync_compressor: bool = False
                ):
 
     # If we had constructed MFGs, then the input nodes for the first block might be
@@ -270,6 +275,8 @@ def train_pass(gnn_model: torch.nn.Module,
         features = features[train_blocks[0].input_nodes]
 
     gnn_model.train()
+    if comp_mod is not None:
+        comp_mod.train()
     t1 = time.time()
     logits = gnn_model(train_blocks, features)
     print('forward time ', time.time() - t1, flush=True)
@@ -291,6 +298,8 @@ def train_pass(gnn_model: torch.nn.Module,
     t1 = time.time()
     if (train_iter_idx + 1) % fed_agg_round == 0:
         sar.gather_grads(gnn_model)
+        if sync_compressor:
+            sar.gather_grads(comp_mod)
         print("Aggregating models across clients", flush=True)
     print(f'gather grad time : ', time.time() - t1, flush=True)
     optimizer.step()
@@ -368,6 +377,7 @@ def main():
     sar.comm.all_reduce(num_labels, dist.ReduceOp.MAX,
                         move_to_comm_device=True)
     num_labels = num_labels.item()
+    comp_mod = None
 
     features = sar.suffix_key_lookup(
         partition_data.node_features, 'features').to(device)
@@ -462,6 +472,8 @@ def main():
 
     # Synchronize the model parmeters across all workers
     sar.sync_params(gnn_model)
+    if comp_mod is not None and args.sync_compressor:
+        sar.sync_params(comp_mod)
 
     # Obtain the number of labeled nodes in the training
     # This will be needed to properly obtain a cross entropy loss
@@ -471,13 +483,17 @@ def main():
                         move_to_comm_device=True)
     n_train_points = n_train_points.item()
 
-    optimizer = torch.optim.Adam(gnn_model.parameters(), lr=args.lr)
+    if comp_mod is None:
+        optimizer = torch.optim.Adam(gnn_model.parameters(), lr=args.lr)
+    else:
+        optimizer = torch.optim.Adam(list(gnn_model.parameters()) + list(comp_mod.parameters()), lr=args.lr)
     best_val_acc = torch.Tensor(0)
     model_acc = torch.Tensor(0)
     for train_iter_idx in range(args.train_iters):
         t_1 = time.time()
         Config.train_iter = train_iter_idx
-        train_pass(gnn_model,
+        train_pass(gnn_model, 
+                   comp_mod,
                    optimizer,
                    train_blocks,
                    features,
@@ -486,9 +502,11 @@ def main():
                    n_train_points,
                    args.construct_mfgs,
                    train_iter_idx=train_iter_idx,
-                   fed_agg_round=args.fed_agg_round)
+                   fed_agg_round=args.fed_agg_round,
+                   sync_compressor=args.sync_compressor)
         train_time = time.time() - t_1
 
+        comp_mod.eval()
         (train_loss, train_acc, val_loss, val_acc, test_loss, test_acc) = \
             infer_pass(gnn_model,
                        eval_blocks,
