@@ -21,7 +21,7 @@
 '''
 Tuples for grouping related data
 '''
-from typing import NamedTuple, Dict, Tuple, List, Optional, Any, TYPE_CHECKING
+from typing import NamedTuple, Dict, Tuple, List, Any, TYPE_CHECKING
 from enum import Enum
 from torch import Tensor
 

@@ -41,7 +41,7 @@ import torch.distributed as dist
 
 
 from ..common_tuples import ShardEdgesAndFeatures, AggregationData, TensorPlace, ShardInfo
-from ..comm import exchange_tensors,  rank, all_reduce
+from ..comm import exchange_tensors,  rank, all_reduce, world_size
 from .sar_aggregation import sar_op
 from .full_partition_block import DistributedBlock
 
@@ -171,11 +171,11 @@ class GraphShardManager:
     Manages the local graph partition and exposes a subset of the interface
     of dgl.heterograph.DGLHeteroGraph. Most importantly, it implements a
     distributed version of the ``update_all`` and ``apply_edges`` functions
-    which are extensively used by GNN layers to exchange messages. By default, 
-    both  ``update_all`` and  ``apply_edges`` use sequential aggregation and 
-    rematerialization (SAR) to minimize data duplication across the workers. 
-    In some cases, this might introduce extra communication and computation overhead. 
-    SAR can be disabled by setting :attr:`Config.disable_sr` to False to avoid this overhead. 
+    which are extensively used by GNN layers to exchange messages. By default,
+    both  ``update_all`` and  ``apply_edges`` use sequential aggregation and
+    rematerialization (SAR) to minimize data duplication across the workers.
+    In some cases, this might introduce extra communication and computation overhead.
+    SAR can be disabled by setting :attr:`Config.disable_sr` to False to avoid this overhead.
     Memory consumption may jump up siginifcantly, however. You should not construct
     GraphShardManager directly, but should use :func:`sar.construct_mfgs` and :func:`sar.construct_full_graph`
     instead.
@@ -232,6 +232,7 @@ class GraphShardManager:
         self.edata = ChainedDataView(self.num_edges())
 
         self._sampling_graph = None
+        self._full_graph = None
 
     @ property
     def tgt_node_range(self) -> Tuple[int, int]:
@@ -257,6 +258,34 @@ class GraphShardManager:
         if self._sampling_graph is not None:
             return self._sampling_graph
 
+        self._sampling_graph = self.get_local_graph()
+        return self._sampling_graph
+
+    @property
+    def full_graph(self):
+        """
+        Returns the full graph topology by gathering this topology from all
+        workers
+
+        """
+        if self._full_graph is not None:
+            return self._full_graph
+
+        local_graph = self.get_local_graph()
+        src_nodes, dst_nodes = local_graph.all_edges()
+        full_graph_src_nodes = exchange_tensors([src_nodes] * world_size())
+        full_graph_dst_nodes = exchange_tensors([dst_nodes] * world_size())
+
+        full_graph = dgl.graph((torch.cat(full_graph_src_nodes),
+                                torch.cat(full_graph_dst_nodes)), num_nodes=self.graph_shards[-1].src_range[1])
+
+        for efeat_key, efeat_value in local_graph.edata.items():
+            full_efeat_value = exchange_tensors([efeat_value]*world_size())
+            full_graph.edata[efeat_key] = torch.cat(full_efeat_value)
+
+        return full_graph
+
+    def get_local_graph(self) -> DGLHeteroGraph:
         global_src_nodes = []
         global_tgt_nodes = []
         for shard in self.graph_shards:
@@ -266,10 +295,10 @@ class GraphShardManager:
                 shard.unique_tgt_nodes[shard.graph.all_edges()[1]])
 
         # We only need the csc format for sampling
-        sampling_graph = dgl.graph((torch.cat(global_src_nodes),
-                                    torch.cat(global_tgt_nodes)),
-                                   num_nodes=self.graph_shards[-1].src_range[1]).shared_memory(
-                                       'sample_graph'+repr(os.getpid()), formats=['csc'])
+        local_graph = dgl.graph((torch.cat(global_src_nodes),
+                                 torch.cat(global_tgt_nodes)),
+                                num_nodes=self.graph_shards[-1].src_range[1])  # .shared_memory(
+#            'sample_graph'+repr(os.getpid()), formats=['csc'])
         del global_src_nodes, global_tgt_nodes
 
         edge_feat_dict: Dict[str, Tensor] = {}
@@ -278,10 +307,8 @@ class GraphShardManager:
                 torch.cat([g_shard.graph.edata[edge_feat_key]
                            for g_shard in self.graph_shards]).share_memory_()
 
-        sampling_graph.edata.update(edge_feat_dict)
-
-        self._sampling_graph = sampling_graph
-        return sampling_graph
+        local_graph.edata.update(edge_feat_dict)
+        return local_graph
 
     def update_boundary_nodes_indices(self) -> List[Tensor]:
         all_my_sources_indices = [

@@ -60,6 +60,11 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--hybrid-partitioning", action="store_true",
+    help="Run on CPUs if set, otherwise run on GPUs "
+)
+
+parser.add_argument(
     "--precompute-batches", action="store_true",
     help="Precompute the batches "
 )
@@ -219,6 +224,7 @@ def main():
         full_graph_manager,
         train_nodes,
         neighbor_sampler,
+        args.hybrid_partitioning,
         args.batch_size,
         shuffle=True,
         precompute_optimized_batches=args.precompute_batches,

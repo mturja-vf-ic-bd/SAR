@@ -247,20 +247,10 @@ class DistNeighborSampler:
 
         return local_sampled_graph, local_sampled_graph_edata
 
-    def sample(self, full_graph_manager: GraphShardManager,
-               seeds: Tensor) -> List[DGLBlock]:
-        """
-        Distributed sampling
-
-        :param full_graph_manager: The distributed graph from which to sample
-        :type full_graph_manager: GraphShardManager
-        :param seeds: The seed nodes for sampling
-        :type seeds: Tensor
-        :returns: A list of ``DGLBlock`` objects with the same length as ``fanouts``
-        :rtype: List[DGLBlock]
-        """
-        sampling_graph = full_graph_manager.sampling_graph
+    def _sample_distributed_graph(self, full_graph_manager: GraphShardManager,
+                                  seeds: Tensor):
         node_ranges = full_graph_manager.node_ranges
+        sampling_graph = full_graph_manager.sampling_graph
 
         final_sampled_graphs = [dgl.to_block(self._sample_local(sampling_graph,
                                                                 self.fanouts[-1], seeds), seeds)]
@@ -305,10 +295,42 @@ class DistNeighborSampler:
 
         return final_sampled_graphs[::-1]
 
+    def _sample_hybrid_graph(self, full_graph_manager: GraphShardManager,
+                             seeds: Tensor):
+        node_ranges = full_graph_manager.node_ranges
+
+        full_graph = full_graph_manager.full_graph
+        multi_layer_sampler = dgl.dataloading.NeighborSampler(self.fanouts)
+        input_nodes, _, final_sampled_graphs = multi_layer_sampler.sample_blocks(full_graph, seeds)
+        self._add_output_features(final_sampled_graphs[-1], node_ranges)
+        self._add_input_features(
+            final_sampled_graphs[0], input_nodes, node_ranges)
+
+        return final_sampled_graphs
+
+    def sample(self, full_graph_manager: GraphShardManager,
+               seeds: Tensor, use_hybrid_partitioning: bool) -> List[DGLBlock]:
+        """
+        Distributed sampling
+
+        :param full_graph_manager: The distributed graph from which to sample
+        :type full_graph_manager: GraphShardManager
+        :param seeds: The seed nodes for sampling
+        :type seeds: Tensor
+        :returns: A list of ``DGLBlock`` objects with the same length as ``fanouts``
+        :rtype: List[DGLBlock]
+        """
+
+        if use_hybrid_partitioning:
+            return self._sample_distributed_graph(full_graph_manager, seeds)
+        else:
+            return self._sample_hybrid_graph(full_graph_manager, seeds)
+
 
 def DataLoader(full_graph_manager: GraphShardManager,
                seed_nodes: Tensor,
                graph_sampler: DistNeighborSampler,
+               use_hybrid_partitioning=False,
                batch_size: int = 1,
                drop_last: bool = False,
                shuffle: bool = False,
@@ -343,7 +365,7 @@ def DataLoader(full_graph_manager: GraphShardManager,
 
     """
     node_collator = NodeCollator(full_graph_manager,
-                                 graph_sampler)
+                                 graph_sampler, use_hybrid_partitioning)
 
     process_init_foo = functools.partial(sample_process_init_fn,
                                          _rank=rank(),
@@ -405,10 +427,11 @@ class NodeCollator:
     """
 
     def __init__(self, full_graph_manager: GraphShardManager,
-                 graph_sampler: DistNeighborSampler):
+                 graph_sampler: DistNeighborSampler, use_hybrid_partitioning: bool):
 
         self.full_graph_manager = full_graph_manager
         self.graph_sampler = graph_sampler
+        self.use_hybrid_partitioning = use_hybrid_partitioning
 
     def collate(self, indices_parts):
         if indices_parts[0].ndim == 0:  # sampling from nodes
@@ -418,6 +441,6 @@ class NodeCollator:
 
         final_indices = torch.unique(final_indices)
         blocks = self.graph_sampler.sample(self.full_graph_manager,
-                                           final_indices)
+                                           final_indices, self.use_hybrid_partitioning)
 
         return blocks
