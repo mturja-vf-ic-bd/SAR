@@ -30,7 +30,7 @@ python3 train_homogeneous_sampling_basic.py --partitioning-json-file /path/to/pa
 
 ```
 
-#### Training with compression
+## Training with compression
 There are 3 supported compression types : ``feature``, ``variable``, and ``pca``. They are supported in both full-graph training and sampling-based training modes. For full-graph training, you need to use the ``one_shot_aggregation`` training mode. For sampling-based training, you need to use the ``--hybrid-partitioning`` flag.
 
 An example of full-graph training with compression
