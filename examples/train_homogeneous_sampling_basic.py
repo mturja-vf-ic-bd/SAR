@@ -20,6 +20,8 @@
 
 from typing import List, Union, Dict
 from argparse import ArgumentParser
+import sys
+
 import os
 import logging
 import psutil
@@ -33,6 +35,10 @@ from dgl.heterograph import DGLBlock  # type: ignore
 
 
 import sar
+from sar.core.compressor import \
+    FeatureCompressorDecompressor, NodeCompressorDecompressor, SubgraphCompressorDecompressor, VariableFeatureCompressorDecompressor, PCACompressorDecompressor
+
+from sar.config import Config
 
 
 parser = ArgumentParser(
@@ -59,6 +65,7 @@ parser.add_argument(
     help="Run on CPUs if set, otherwise run on GPUs "
 )
 
+
 parser.add_argument(
     "--hybrid-partitioning", action="store_true",
     help="Run on CPUs if set, otherwise run on GPUs "
@@ -76,6 +83,24 @@ parser.add_argument(
     default="",
     help="Prefix of the files used to store precomputed batches "
 )
+
+# Newly added arguments for compression decompression module
+parser.add_argument('--enable_cr', action='store_true',
+                    default=False, help="Turn on compression before \
+                    sending to remote clients")
+
+parser.add_argument('--comp_ratio', default=None, type=int,
+                    help="Compression ratio for sub-graph based compression")
+
+parser.add_argument('--min_comp_ratio', default=None, type=int,
+                    help="min Compression ratio for variable feature-based compression")
+
+parser.add_argument('--max_comp_ratio', default=None, type=int,
+                    help="max Compression ratio for variable feature-based compression")
+
+parser.add_argument('--compression_type', default="feature", type=str,
+                    choices=["feature", "node", "subgraph", "variable", "pca"],
+                    help="Choose among three possible compression types")
 
 
 parser.add_argument('--train-iters', default=100, type=int,
@@ -126,10 +151,14 @@ class GNNModel(nn.Module):
             dgl.nn.SAGEConv(hidden_dim, out_dim, aggregator_type='mean'),
         ])
 
+        self.bns = nn.ModuleList([nn.BatchNorm1d(hidden_dim),
+                                  nn.BatchNorm1d(hidden_dim)])
+
     def forward(self,  blocks: List[Union[DGLBlock, sar.GraphShardManager]], features: torch.Tensor):
         for idx, conv in enumerate(self.convs):
             features = conv(blocks[idx], features)
             if idx < len(self.convs) - 1:
+                features = self.bns[idx](features)
                 features = F.relu(features, inplace=True)
 
         return features
@@ -142,6 +171,11 @@ def main():
 
     use_gpu = torch.cuda.is_available() and not args.cpu_run
     device = torch.device('cuda') if use_gpu else torch.device('cpu')
+
+    Config.total_layers = 3
+    Config.total_train_iter = args.train_iters
+    Config.enable_cr = args.enable_cr
+    Config.compression_type = args.compression_type
 
     if args.rank == -1:
         # Try to infer the worker's rank from environment variables
@@ -180,8 +214,15 @@ def main():
 
     # Obtain the number of classes by finding the max label across all workers
     num_labels = labels.max() + 1
+    A = torch.ones(13)
+#    sar.comm.all_reduce(A, dist.ReduceOp.MAX,
+#                        move_to_comm_device=False)
+    print('dummy reduce')
+    dist.all_reduce(A)
+
+    print('num labels', num_labels)
     sar.comm.all_reduce(num_labels, dist.ReduceOp.MAX,
-                        move_to_comm_device=True)
+                        move_to_comm_device=False)
     num_labels = num_labels.item()
 
     features = sar.suffix_key_lookup(
@@ -191,7 +232,7 @@ def main():
 
     node_ranges = partition_data.node_ranges
     del partition_data
-
+    print('deleted partition data')
     gnn_model = GNNModel(features.size(1),
                          args.hidden_layer_dim,
                          num_labels).to(device)
@@ -203,6 +244,34 @@ def main():
                                  num_labels)
     else:
         gnn_model_cpu = gnn_model
+    if args.enable_cr:
+        if args.compression_type == "feature":
+            comp_mod = FeatureCompressorDecompressor(
+                feature_dim=[features.size(1)],
+                comp_ratio=[float(args.comp_ratio)]
+            )
+        elif args.compression_type == "variable":
+            comp_mod = VariableFeatureCompressorDecompressor(
+                feature_dim=[features.size(1)],
+                min_comp_ratio=args.min_comp_ratio,
+                max_comp_ratio=args.max_comp_ratio,
+            )
+        elif args.compression_type == 'pca':
+            comp_mod = PCACompressorDecompressor(
+                feature_dim=[features.size(1)],
+                min_comp_ratio=(
+                    args.comp_ratio if args.min_comp_ratio is None else args.min_comp_ratio),
+                max_comp_ratio=(
+                    args.comp_ratio if args.max_comp_ratio is None else args.max_comp_ratio)
+            )
+
+        else:
+            raise NotImplementedError("Undefined compression_type."
+                                      "Must be one of feature/node/subgraph")
+        gnn_model.comp_model = comp_mod
+    else:
+        comp_mod = None
+
     print('model', gnn_model)
 
     # Synchronize the model parmeters across all workers
@@ -215,7 +284,8 @@ def main():
                                                                  'features': features},
                                                              output_node_features={
                                                                  'labels': labels},
-                                                             output_device=device
+                                                             output_device=device,
+                                                             compression_decompression=comp_mod
                                                              )
 
     train_nodes = masks['train_indices'] + node_ranges[sar.rank()][0]
@@ -238,9 +308,13 @@ def main():
         masks[k] = masks[k].to(device)
 
     for train_iter_idx in range(args.train_iters):
+        Config.train_iter = train_iter_idx
+        Config.comm_time_forward = 0
+        Config.comm_time_backward = 0
+
         total_loss = 0
         gnn_model.train()
-        sar.Config.max_collective_size = 0
+        Config.max_collective_size = args.max_collective_size
 
         train_t1 = dataloader_t1 = time.time()
         n_total = n_correct = 0
@@ -283,7 +357,7 @@ def main():
         gnn_model_cpu.eval()
         if gnn_model_cpu is not gnn_model:
             gnn_model_cpu.load_state_dict(gnn_model.state_dict())
-        sar.Config.max_collective_size = args.max_collective_size
+        Config.max_collective_size = args.max_collective_size
         with torch.no_grad():
             # Calculate accuracy for train/validation/test
             logits = gnn_model_cpu(
@@ -306,11 +380,20 @@ def main():
                 f"iteration [{train_iter_idx}/{args.train_iters}] | "
             )
             result_message += ', '.join([
+                f"Loss: "
+                f"train={0.0:.4f}, "
+                f"valid={0.0:.4f} "
+                f"test={0.0:.4f} "
+                f" | "
                 f"Accuracy: "
                 f"train={train_acc:.4f} "
                 f"valid={val_acc:.4f} "
                 f"test={test_acc:.4f} "
+                f"model={test_acc:.4f}"
                 f" | train time = {train_time} "
+                f" | forward comm  time = {Config.comm_time_forward} "
+                f" | backward comm  time = {Config.comm_time_backward} "
+
                 f" |"
             ])
             print(result_message, flush=True)

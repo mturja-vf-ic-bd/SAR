@@ -27,9 +27,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 import torch.distributed as dist
+#from torch.utils.tensorboard import SummaryWriter
 import dgl  # type: ignore
 
 import sar
+from sar.core.compressor import \
+    FeatureCompressorDecompressor, NodeCompressorDecompressor, SubgraphCompressorDecompressor, VariableFeatureCompressorDecompressor, PCACompressorDecompressor
+from sar.config import Config
 
 
 parser = ArgumentParser(
@@ -62,6 +66,12 @@ parser.add_argument(
 
 parser.add_argument(
     "--cpu-run", action="store_true",
+    help="Run on CPUs if set, otherwise run on GPUs "
+)
+
+
+parser.add_argument(
+    "--train-compressor", action="store_true",
     help="Run on CPUs if set, otherwise run on GPUs "
 )
 
@@ -102,6 +112,42 @@ parser.add_argument('--n-layers', default=3, type=int,
 parser.add_argument('--layer-dim', default=256, type=int,
                     help='Dimension of GNN hidden layer')
 
+parser.add_argument('--n_kernel', default=None, type=int,
+                    help='Number of channels in the fixed compression channel-set')
+
+parser.add_argument('--log_dir', default="log", type=str,
+                    help='Parent directory for logging')
+
+parser.add_argument('--fed_agg_round', default=501, type=int,
+                    help='number of training iterations after \
+                        which weights across clients will \
+                            be aggregated')
+
+# Newly added arguments for compression decompression module
+parser.add_argument('--enable_cr', action='store_true',
+                    default=False, help="Turn on compression before \
+                    sending to remote clients")
+
+parser.add_argument('--comp_ratio', default=None, type=int,
+                    help="Compression ratio for sub-graph based compression")
+
+parser.add_argument('--min_comp_ratio', default=None, type=int,
+                    help="min Compression ratio for variable feature-based compression")
+
+parser.add_argument('--max_comp_ratio', default=None, type=int,
+                    help="max Compression ratio for variable feature-based compression")
+
+parser.add_argument('--compression_type', default="feature", type=str,
+                    choices=["feature", "node", "subgraph", "variable", "pca"],
+                    help="Choose among three possible compression types")
+
+parser.add_argument('--enable_vcr', action='store_true',
+                    default=False, help="Turn on variable compression ratio")
+
+parser.add_argument('--compression_step', default=None, type=int,
+                    help="Number of training iteration after which compression ratio \
+                        changes for variable compression ratio")
+
 
 class GNNModel(nn.Module):
     def __init__(self,  gnn_layer: str, n_layers: int, layer_dim: int,
@@ -114,10 +160,12 @@ class GNNModel(nn.Module):
         self.convs = nn.ModuleList()
         for idx in range(len(dims) - 1):
             if gnn_layer == 'gat':
-                # use 2 aattention heads
-                layer = dgl.nn.GATConv(dims[idx], dims[idx+1], 2)  # pylint: disable=no-member
+                # use 2 attention heads
+                layer = dgl.nn.GATConv(
+                    dims[idx], dims[idx+1], 2)  # pylint: disable=no-member
             elif gnn_layer == 'gcn':
-                layer = dgl.nn.GraphConv(dims[idx], dims[idx+1])  # pylint: disable=no-member
+                layer = dgl.nn.GraphConv(
+                    dims[idx], dims[idx+1])  # pylint: disable=no-member
             elif gnn_layer == 'sage':
                 # Use mean aggregtion
                 # pylint: disable=no-member
@@ -126,17 +174,23 @@ class GNNModel(nn.Module):
             else:
                 raise ValueError(f'unknown gnn layer type {gnn_layer}')
             self.convs.append(layer)
+        #self.dropout = nn.Dropout(0.5)
 
-    def forward(self,  blocks: List[Union[sar.GraphShardManager, sar.DistributedBlock]],
+    def forward(self, blocks: List[Union[sar.GraphShardManager, sar.DistributedBlock]],
                 features: torch.Tensor):
         for idx, conv in enumerate(self.convs):
+            Config.current_layer_index = idx
+            t1 = time.time()
             features = conv(blocks[idx], features)
+            t2 = time.time() - t1
+            print(f'total conv time {t2}', flush=True)
             if features.ndim == 3:  # GAT produces an extra n_heads dimension
                 # collapse the n_heads dimension
                 features = features.mean(1)
 
             if idx < len(self.convs) - 1:
                 features = F.relu(features, inplace=True)
+                #features = self.dropout(features)
 
         return features
 
@@ -166,13 +220,15 @@ def infer_pass(gnn_model: torch.nn.Module,
         start_index = 0
         for indices_name in ['train_indices', 'val_indices', 'test_indices']:
             active_indices = masks[indices_name]
-            active_logits = logits[start_index:  start_index + active_indices.numel()]
+            active_logits = logits[start_index:  start_index +
+                                   active_indices.numel()]
             if active_indices.numel() > 0:
                 loss = F.cross_entropy(active_logits,
                                        labels[active_indices], reduction='sum')
                 n_correct = (active_logits.argmax(1) ==
                              labels[active_indices]).float().sum()
-                results.extend([loss.item(), n_correct.item(), active_indices.numel()])
+                results.extend(
+                    [loss.item(), n_correct.item(), active_indices.numel()])
                 start_index += active_indices.numel()
             else:
                 results.extend([0.0, 0.0, 0.0])
@@ -185,13 +241,15 @@ def infer_pass(gnn_model: torch.nn.Module,
                                        labels[active_indices], reduction='sum')
                 n_correct = (active_logits.argmax(1) ==
                              labels[active_indices]).float().sum()
-                results.extend([loss.item(), n_correct.item(), active_indices.numel()])
+                results.extend(
+                    [loss.item(), n_correct.item(), active_indices.numel()])
             else:
                 results.extend([0.0, 0.0, 0.0])
 
     loss_acc_vec = torch.FloatTensor(results)
     # Sum the loss, n_correct, and number of mask elements across all workers
-    sar.comm.all_reduce(loss_acc_vec, op=dist.ReduceOp.SUM, move_to_comm_device=True)
+    sar.comm.all_reduce(loss_acc_vec, op=dist.ReduceOp.SUM,
+                        move_to_comm_device=True)
 
     (train_loss, train_acc, val_loss, val_acc, test_loss, test_acc) = \
         (loss_acc_vec[0] / loss_acc_vec[2],
@@ -211,7 +269,10 @@ def train_pass(gnn_model: torch.nn.Module,
                train_mask: torch.Tensor,
                labels: torch.Tensor,
                n_train_points: int,
-               mfg_blocks: bool):
+               mfg_blocks: bool,
+               train_iter_idx: int,
+               fed_agg_round: int
+               ):
 
     # If we had constructed MFGs, then the input nodes for the first block might be
     # a subset of the the nodes in the partition. Use the input_nodes member of
@@ -221,7 +282,9 @@ def train_pass(gnn_model: torch.nn.Module,
         features = features[train_blocks[0].input_nodes]
 
     gnn_model.train()
+    t1 = time.time()
     logits = gnn_model(train_blocks, features)
+    print('forward time ', time.time() - t1, flush=True)
 
     if mfg_blocks:
         # By construction, the output nodes of the top layer training MFG are
@@ -233,9 +296,26 @@ def train_pass(gnn_model: torch.nn.Module,
                                labels[train_mask], reduction='sum')/n_train_points
 
     optimizer.zero_grad()
+#    pre_comp_grads = [
+#        x.grad for x in train_blocks[0]._compression_decompression.parameters()]
+
+#    print('pre backward grads', pre_comp_grads)
+
+    t1 = time.time()
     loss.backward()
+    print('backward time ', time.time() - t1, flush=True)
     # Do not forget to gather the parameter gradients from all workers
-    sar.gather_grads(gnn_model)
+    t1 = time.time()
+    if (train_iter_idx + 1) % fed_agg_round == 0:
+        sar.gather_grads(gnn_model)
+        print("Aggregating models across clients", flush=True)
+    print(f'gather grad time : ', time.time() - t1, flush=True)
+
+#    pre_comp_grads = [
+#        x.grad for x in train_blocks[0]._compression_decompression.parameters()]
+
+#    print('post backward grads', pre_comp_grads)
+
     optimizer.step()
 
 
@@ -243,9 +323,9 @@ def main():
     args = parser.parse_args()
     print('args', args)
 
-    #Patch DGL's attention-based layers and RelGraphConv to support distributed graphs
+    # Patch DGL's attention-based layers and RelGraphConv to support distributed graphs
     sar.patch_dgl()
-    
+
     if args.rank == -1:
         # Try to infer the worker's rank from environment variables
         # created by mpirun or similar MPI launchers
@@ -261,6 +341,15 @@ def main():
             args.world_size = int(os.environ["WORLD_SIZE"])
 
     use_gpu = torch.cuda.is_available() and not args.cpu_run
+    Config.total_layers = args.n_layers
+    Config.total_train_iter = args.train_iters
+    Config.enable_cr = args.enable_cr
+    Config.compression_type = args.compression_type
+    Config.step = args.compression_step
+    Config.enable_vcr = args.enable_vcr
+
+    # Create log directory
+    #writer = SummaryWriter(f"{args.log_dir}/ogbn-arxiv/lr={args.lr}/n_clients={args.world_size}/rank={args.rank}")
 
     device = torch.device('cuda' if use_gpu else 'cpu')
     if args.backend == 'nccl':
@@ -299,10 +388,13 @@ def main():
 
     # Obtain the number of classes by finding the max label across all workers
     num_labels = labels.max() + 1
-    sar.comm.all_reduce(num_labels, dist.ReduceOp.MAX, move_to_comm_device=True)
+    sar.comm.all_reduce(num_labels, dist.ReduceOp.MAX,
+                        move_to_comm_device=True)
     num_labels = num_labels.item()
-    
-    features = sar.suffix_key_lookup(partition_data.node_features, 'features').to(device)
+
+    features = sar.suffix_key_lookup(
+        partition_data.node_features, 'features').to(device)
+
     if args.construct_mfgs:
         # sar.construct_mfgs needs the global indices of the seed nodes.
         # We obtain the global indices by getting the indices of the labeled nodes
@@ -310,22 +402,26 @@ def main():
         # Global node indices are consecutive in each partition
         train_blocks = sar.construct_mfgs(partition_data,
                                           masks['train_indices'] +
-                                          partition_data.node_ranges[sar.comm.rank()][0],
+                                          partition_data.node_ranges[sar.comm.rank(
+                                          )][0],
                                           args.n_layers)
         # During evaluation we want to also evaluate on the training nodes
         eval_blocks = sar.construct_mfgs(partition_data,
                                          torch.cat((masks['train_indices'],
                                                     masks['val_indices'],
                                                     masks['test_indices'])) +
-                                         partition_data.node_ranges[sar.comm.rank()][0],
+                                         partition_data.node_ranges[sar.comm.rank(
+                                         )][0],
                                          args.n_layers)
 
         # If we use the one_shot_aggregation mode (mode 3), we need to use the
         # DistributedBlock representation instead of the GraphShardManager representation
         # The DistributedBlock representation can be obtained using get_full_partition_graph
         if args.train_mode == 'one_shot_aggregation':
-            train_blocks = [block.get_full_partition_graph() for block in train_blocks]
-            eval_blocks = [block.get_full_partition_graph() for block in eval_blocks]
+            train_blocks = [block.get_full_partition_graph()
+                            for block in train_blocks]
+            eval_blocks = [block.get_full_partition_graph()
+                           for block in eval_blocks]
 
         # Move the graph objects to the training device
         train_blocks = [block.to(device) for block in train_blocks]
@@ -334,7 +430,53 @@ def main():
     else:  # No MFGs. The same full graph in every layer
         full_graph_manager = sar.construct_full_graph(partition_data)
         if args.train_mode == 'one_shot_aggregation':
+            indices_required_from_me = full_graph_manager.indices_required_from_me
+            tgt_node_range = full_graph_manager.tgt_node_range
             full_graph_manager = full_graph_manager.get_full_partition_graph()
+            feature_dim = [features.size(
+                1)] + [args.layer_dim] * (args.n_layers - 2) + [num_labels]
+            if args.compression_type == "feature":
+                comp_mod = FeatureCompressorDecompressor(
+                    feature_dim=feature_dim,
+                    comp_ratio=[float(args.comp_ratio)] * args.n_layers
+                )
+            elif args.compression_type == "variable":
+                comp_mod = VariableFeatureCompressorDecompressor(
+                    feature_dim=feature_dim,
+                    min_comp_ratio=args.min_comp_ratio,
+                    max_comp_ratio=args.max_comp_ratio
+                )
+            elif args.compression_type == 'pca':
+                comp_mod = PCACompressorDecompressor(
+                    feature_dim=feature_dim,
+                    min_comp_ratio=(
+                        args.comp_ratio if args.min_comp_ratio is None else args.min_comp_ratio),
+                    max_comp_ratio=(
+                        args.comp_ratio if args.max_comp_ratio is None else args.max_comp_ratio)
+                )
+
+            elif args.compression_type == "node":
+                comp_mod = NodeCompressorDecompressor(
+                    feature_dim=feature_dim,
+                    comp_ratio=args.comp_ratio,
+                    step=32,
+                    enable_vcr=True
+                )
+            elif args.compression_type == "subgraph":
+                comp_mod = SubgraphCompressorDecompressor(
+                    feature_dim=feature_dim,
+                    full_local_graph=full_graph_manager,
+                    indices_required_from_me=indices_required_from_me,
+                    tgt_node_range=tgt_node_range,
+                    comp_ratio=args.comp_ratio,
+                    step=32,
+                    enable_vcr=True
+                )
+            else:
+                raise NotImplementedError("Undefined compression_type."
+                                          "Must be one of feature/node/subgraph")
+            full_graph_manager._compression_decompression = comp_mod
+
         full_graph_manager = full_graph_manager.to(device)
         train_blocks = [full_graph_manager] * args.n_layers
         eval_blocks = [full_graph_manager] * args.n_layers
@@ -347,15 +489,16 @@ def main():
 
     sar.Config.max_collective_size = args.max_collective_size
 
-    #We do not need the partition data anymore
+    # We do not need the partition data anymore
     del partition_data
-
 
     gnn_model = GNNModel(args.gnn_layer,
                          args.n_layers,
                          args.layer_dim,
                          input_feature_dim=features.size(1),
                          n_classes=num_labels).to(device)
+    if args.train_compressor:
+        gnn_model.compressor_decompressor = full_graph_manager._compression_decompression
     print('model', gnn_model)
 
     # Synchronize the model parmeters across all workers
@@ -365,12 +508,22 @@ def main():
     # This will be needed to properly obtain a cross entropy loss
     # normalized by the number of training examples
     n_train_points = torch.LongTensor([masks['train_indices'].numel()])
-    sar.comm.all_reduce(n_train_points, op=dist.ReduceOp.SUM, move_to_comm_device=True)
+    sar.comm.all_reduce(n_train_points, op=dist.ReduceOp.SUM,
+                        move_to_comm_device=True)
     n_train_points = n_train_points.item()
 
+ #   orig_comp_params = [
+ #       x.clone() for x in full_graph_manager._compression_decompression.parameters()]
+
     optimizer = torch.optim.Adam(gnn_model.parameters(), lr=args.lr)
+    best_val_acc = torch.Tensor(0)
+    model_acc = torch.Tensor(0)
     for train_iter_idx in range(args.train_iters):
         t_1 = time.time()
+        Config.train_iter = train_iter_idx
+        Config.comm_time_forward = 0
+        Config.comm_time_backward = 0
+        Config.comp_decomp_time = 0
         train_pass(gnn_model,
                    optimizer,
                    train_blocks,
@@ -378,8 +531,13 @@ def main():
                    masks['train_indices'],
                    labels,
                    n_train_points,
-                   args.construct_mfgs)
+                   args.construct_mfgs,
+                   train_iter_idx=train_iter_idx,
+                   fed_agg_round=args.fed_agg_round)
         train_time = time.time() - t_1
+        comm_time_forward = Config.comm_time_forward
+        comm_time_backward = Config.comm_time_backward
+        comp_decomp_time = Config.comp_decomp_time
 
         (train_loss, train_acc, val_loss, val_acc, test_loss, test_acc) = \
             infer_pass(gnn_model,
@@ -389,6 +547,13 @@ def main():
                        labels,
                        args.construct_mfgs)
 
+        if train_iter_idx == 0:
+            best_val_acc = val_acc
+            model_acc = test_acc
+        if (train_iter_idx + 1) % args.fed_agg_round == 0:
+            if val_acc >= best_val_acc:
+                best_val_acc = val_acc
+                model_acc = test_acc
         result_message = (
             f"iteration [{train_iter_idx}/{args.train_iters}] | "
         )
@@ -402,10 +567,18 @@ def main():
             f"train={train_acc:.4f} "
             f"valid={val_acc:.4f} "
             f"test={test_acc:.4f} "
+            f"model={model_acc:.4f}"
             f" | train time = {train_time} "
+            f" | forward comm  time = {comm_time_forward} "
+            f" | backward comm  time = {comm_time_backward} "
+
             f" |"
         ])
         print(result_message, flush=True)
+        print('comp decomp time', comp_decomp_time)
+#        disc = [((x-y)**2).sum() for x, y in zip(
+#            full_graph_manager._compression_decompression.parameters(), orig_comp_params)]
+#        print('comp decomp disc', disc)
 
 
 if __name__ == '__main__':

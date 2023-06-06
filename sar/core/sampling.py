@@ -22,10 +22,12 @@ from typing import List,  Tuple, Dict, Optional,   cast, Union
 import functools
 import os
 import logging
+import time
 import torch
 import dgl  # type: ignore
 from dgl.heterograph import DGLBlock  # type: ignore
 from dgl.heterograph import DGLHeteroGraph as DGLGraph  # type: ignore
+# from dgl.heterograph import DGLGraph  # type: ignore
 
 from dgl.sampling import sample_neighbors  # type: ignore
 import dgl.partition  # type:ignore
@@ -36,6 +38,8 @@ import torch.distributed as dist
 from ..comm import rank, exchange_tensors, world_size,\
     master_ip, master_port, backend, comm_device, initialize_comms, all_reduce
 from .graphshard import GraphShardManager
+from ..config import Config
+
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -151,11 +155,13 @@ class DistNeighborSampler:
                  copy_edata: Optional[bool] = True,
                  input_node_features: Optional[Dict[str, Tensor]] = None,
                  output_node_features: Optional[Dict[str, Tensor]] = None,
-                 output_device: Optional[torch.device] = None):
+                 output_device: Optional[torch.device] = None,
+                 compression_decompression=None):
         self.fanouts = fanouts
         self.prob = prob
         self.replace = replace
         self.copy_edata = copy_edata
+        self.compression_decompression = compression_decompression
 
         for node_features in [input_node_features, output_node_features]:
             if node_features is not None:
@@ -190,13 +196,40 @@ class DistNeighborSampler:
                 for indices, (start_idx, _) in zip(per_partition_indices, node_ranges)]
             local_nodes = per_partition_input_nodes[rank()]
             per_partition_input_nodes[rank()] = local_nodes.new(0)
+            t1 = time.time()
             requested_nodes = exchange_tensors(per_partition_input_nodes)
-
+            t2 = time.time()
+            print('exchange input features required indices', t2 - t1)
             for feature_name in self.input_node_features:
                 feature_tensor = self.input_node_features[feature_name]
-                fetched_node_features = exchange_tensors([
-                    feature_tensor[indices] for indices
-                    in requested_nodes])
+                requested_features = [feature_tensor[indices]
+                                      for indices in requested_nodes]
+                t1 = time.time()
+                if self.compression_decompression is not None:
+                    with torch.no_grad():
+                        compressed_requested_features = self.compression_decompression.compress(
+                            requested_features, iter=Config.train_iter)
+                    compressed_feat_dim = compressed_requested_features[(
+                        rank() + 1) % (world_size())].size(1)
+
+                    compressed_requested_features[rank()] = compressed_requested_features[rank(
+                    )][:, :compressed_feat_dim]
+
+                    tz = time.time()
+                    print('compressed requested feature size', [
+                          x.size() for x in compressed_requested_features])
+                    compressed_fetched_node_features = exchange_tensors(
+                        compressed_requested_features)
+                    print('communication of compressed tensors', time.time() - tz)
+                    with torch.no_grad():
+                        fetched_node_features = self.compression_decompression.decompress(
+                            compressed_fetched_node_features)
+                else:
+                    fetched_node_features = exchange_tensors(
+                        requested_features)
+                t2 = time.time()
+                print('exchange actual input features', t2 - t1)
+                Config.comm_time_forward += time.time() - t1
                 graph_input_tensor = feature_tensor.new(
                     len(input_nodes), *feature_tensor.size()[1:])
                 for part_idx in range(len(fetched_node_features)):
@@ -209,13 +242,12 @@ class DistNeighborSampler:
                 sampled_block.srcdata[feature_name] = graph_input_tensor.to(
                     sampled_block.device)
 
-    def _add_output_features(self, sampled_block: DGLBlock,
+    def _add_output_features(self, sampled_block: DGLBlock, output_nodes: Tensor,
                              node_ranges: List[Tuple[int, int]]):
         if self.output_node_features is not None:
-            dst_id = sampled_block.dstdata[dgl.NID]
             for feature_key, feature_tensor in self.output_node_features.items():
                 sampled_block.dstdata[feature_key] = \
-                    feature_tensor[dst_id - node_ranges[rank()]
+                    feature_tensor[output_nodes - node_ranges[rank()]
                                    [0]].to(sampled_block.device)
 
     def _make_edata(self, sampling_graph: DGLGraph,
@@ -254,7 +286,7 @@ class DistNeighborSampler:
 
         final_sampled_graphs = [dgl.to_block(self._sample_local(sampling_graph,
                                                                 self.fanouts[-1], seeds), seeds)]
-        self._add_output_features(final_sampled_graphs[0], node_ranges)
+        self._add_output_features(final_sampled_graphs[0], seeds, node_ranges)
         input_nodes = final_sampled_graphs[0].srcdata[dgl.NID].to(
             sampling_graph.device)
         for fanout in self.fanouts[-2:: -1]:
@@ -298,14 +330,19 @@ class DistNeighborSampler:
     def _sample_hybrid_graph(self, full_graph_manager: GraphShardManager,
                              seeds: Tensor):
         node_ranges = full_graph_manager.node_ranges
-
+        t1 = time.time()
         full_graph = full_graph_manager.full_graph
+        print('obtained full graph in ', time.time() - t1)
         multi_layer_sampler = dgl.dataloading.NeighborSampler(self.fanouts)
-        input_nodes, _, final_sampled_graphs = multi_layer_sampler.sample_blocks(full_graph, seeds)
-        self._add_output_features(final_sampled_graphs[-1], node_ranges)
+        input_nodes, _, final_sampled_graphs = multi_layer_sampler.sample_blocks(
+            full_graph, seeds)
+        self._add_output_features(final_sampled_graphs[-1], seeds, node_ranges)
+        tz = time.time()
         self._add_input_features(
             final_sampled_graphs[0], input_nodes, node_ranges)
-
+        t2 = time.time()
+        print('hybrid sampling time', t2 - t1)
+        print('add input features time', t2 - tz)
         return final_sampled_graphs
 
     def sample(self, full_graph_manager: GraphShardManager,
@@ -322,9 +359,9 @@ class DistNeighborSampler:
         """
 
         if use_hybrid_partitioning:
-            return self._sample_distributed_graph(full_graph_manager, seeds)
-        else:
             return self._sample_hybrid_graph(full_graph_manager, seeds)
+        else:
+            return self._sample_distributed_graph(full_graph_manager, seeds)
 
 
 def DataLoader(full_graph_manager: GraphShardManager,

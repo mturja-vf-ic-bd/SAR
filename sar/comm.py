@@ -168,7 +168,7 @@ def initialize_comms(_rank: int, _world_size: int, master_ip_address: str,
 
     if backend == 'ccl':
         # pylint: disable=unused-import
-        import torch_ccl  # type: ignore
+        import oneccl_bindings_for_pytorch  # type: ignore
 
     os.environ['MASTER_ADDR'] = master_ip_address
     os.environ['MASTER_PORT'] = str(master_port_number)
@@ -312,7 +312,12 @@ def all_reduce(red_tensor: torch.Tensor, op: dist.ReduceOp,
 def all_to_all_rounds(recv_tensors: List[torch.Tensor], send_tensors: List[torch.Tensor]):
     if Config.max_collective_size == 0:
         #print('all to all', recv_tensors, send_tensors, flush=True)
+        #        print('sending ', [x.size() for x in send_tensors])
+        #        print('receiving ', [x.size() for x in recv_tensors])
+        #        print('sending actual ', [x for x in send_tensors])
         dist.all_to_all(recv_tensors, send_tensors)
+#        print('receiving actual ', [x for x in recv_tensors])
+
         #print('all to all complete', recv_tensors, send_tensors, flush=True)
     else:
         max_n_elems = Config.max_collective_size
@@ -416,23 +421,24 @@ def exchange_tensors(tensors: List[torch.Tensor], recv_sizes: Optional[List[int]
         x.dtype == dtype for x in tensors[1:]), 'mismatched type tensors'
 
     tensors_comm_device = [x.to(comm_device()) for x in tensors]
-
+    print('ground truth sizes', [x.size() for x in tensors])
     if recv_sizes is None:
-        all_my_sizes = [torch.Tensor([x.size(0)]).long().to(
+        all_my_sizes = [torch.LongTensor([x.size(0)]).long().to(
             comm_device()) for x in tensors]
-        all_their_sizes = [torch.Tensor([-1]).long().to(
+        all_their_sizes = [torch.LongTensor([-1]).long().to(
             comm_device()) for _ in range(len(tensors))]
 
         all_to_all(all_their_sizes, all_my_sizes)
         #print('all my sizes', all_my_sizes)
         #print('all their sizes', all_their_sizes)
 
-        all_their_sizes_i = [cast(int, x.item()) for x in all_their_sizes]
+        all_their_sizes_i = all_their_sizes
     else:
         all_their_sizes_i = recv_sizes
 
     all_their_sizes_aug = [max(1, x) for x in all_their_sizes_i]
     #print('all their sizes aug', all_their_sizes_aug)
+
     recv_tensors = [torch.empty(x, *trailing_dimensions,
                                 dtype=dtype).to(comm_device()).fill_(-1) for x in all_their_sizes_aug]
 

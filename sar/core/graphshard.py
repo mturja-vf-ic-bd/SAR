@@ -282,7 +282,7 @@ class GraphShardManager:
         for efeat_key, efeat_value in local_graph.edata.items():
             full_efeat_value = exchange_tensors([efeat_value]*world_size())
             full_graph.edata[efeat_key] = torch.cat(full_efeat_value)
-
+        self._full_graph = full_graph
         return full_graph
 
     def get_local_graph(self) -> DGLHeteroGraph:
