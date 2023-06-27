@@ -39,7 +39,7 @@ parser = ArgumentParser(
 parser.add_argument(
     "--partitioning-json-file",
     type=str,
-    default="",
+    default="ogbn-arxiv.json",
     help="Path to the .json file containing partitioning information "
 )
 
@@ -117,9 +117,11 @@ def main():
                          args.world_size, master_ip_address,
                          args.backend)
 
+    partitioning_json_file = os.path.join('partition_data','ogbn-arxiv',str(args.world_size),args.partitioning_json_file)
+
     # Load DGL partition data
     partition_data = sar.load_dgl_partition_data(
-        args.partitioning_json_file, args.rank, device)
+        partitioning_json_file, args.rank, device)
 
     # Obtain train,validation, and test masks
     # These are stored as node features. Partitioning may prepend

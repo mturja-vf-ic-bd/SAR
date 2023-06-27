@@ -21,8 +21,9 @@
 from argparse import ArgumentParser
 import dgl  # type:ignore
 import torch
+import os
 from ogb.nodeproppred import DglNodePropPredDataset  # type:ignore
-
+# from ogb.nodeproppred import Evaluator, PygNodePropPredDataset
 
 parser = ArgumentParser(description="Graph partitioning for ogbn-arxiv and ogbn-products")
 
@@ -58,8 +59,12 @@ parser.add_argument(
 
 def main():
     args = parser.parse_args()
+    print('here', args.dataset_root)
     dataset = DglNodePropPredDataset(name=args.dataset_name,
                                      root=args.dataset_root)
+    # dataset = PygNodePropPredDataset(name=args.dataset_name,
+    #                                  root=args.dataset_root)
+    
     graph = dataset[0][0]
     graph = dgl.to_bidirected(graph, copy_ndata=True)
     graph = dgl.add_self_loop(graph)
@@ -80,10 +85,12 @@ def main():
                          [train_mask, val_mask, test_mask, labels, features]):
         graph.ndata[name] = val
 
+    path_to_save = os.path.join(args.partition_out_path, args.dataset_name , str(args.num_partitions) )
+
     dgl.distributed.partition_graph(
         graph, args.dataset_name,
         args.num_partitions,
-        args.partition_out_path,
+        path_to_save,
         num_hops=1,
         reshuffle=True,
         balance_ntypes=train_mask,
