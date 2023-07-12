@@ -59,10 +59,6 @@ parser.add_argument(
     help="Run on CPUs if set, otherwise run on GPUs "
 )
 
-parser.add_argument(
-    "--disable_cut_edges", action="store_false",
-    help="Disable Communication "
-)
 
 parser.add_argument('--train-iters', default=100, type=int,
                     help='number of training iterations ')
@@ -80,9 +76,6 @@ parser.add_argument('--rank', default=0, type=int,
 
 parser.add_argument('--world-size', default=2, type=int,
                     help='Number of workers ')
-
-parser.add_argument('--partitions', default=0, type=int,
-                    help='Number of partitions. By default it will be equal to world-size.')
 
 parser.add_argument('--hidden-layer-dim', default=256, type=int,
                     help='Dimension of GNN hidden layer')
@@ -112,13 +105,8 @@ class GNNModel(nn.Module):
 
 def main():
     args = parser.parse_args()
-    # Make the number of partitions equal to the world size
-    if args.partitions == 0:
-        args.partitions = args.world_size
-    # Make sure that there are more partitions than agents in the world.
-    assert(args.partitions >= args.world_size)
 
-    args.output_dir = os.path.join(args.output_dir ,'partitions_'+str(args.partitions)+'_world_size_'+str(args.world_size)+'_'+ datetime.now().strftime("%Y-%m%d-%H%M") )
+    args.output_dir = os.path.join(args.output_dir ,'world_size_'+str(args.world_size)+'_'+ datetime.now().strftime("%Y-%m%d-%H%M%S") )
     os.makedirs(os.path.join(args.output_dir), exist_ok=True)
 
     # Save the dict
@@ -140,11 +128,16 @@ def main():
                          args.backend)
 
 
-    partitioning_json_file = os.path.join('partition_data','ogbn-arxiv',str(args.partitions),args.partitioning_json_file)
-    
+    partitioning_json_file = os.path.join('partition_data','ogbn-arxiv',str(args.world_size),args.partitioning_json_file)
+
+    # Remove all edges incoming to your partition.
+    # Run code exactly as is. 
+
+    # What if I use compression rate very high. 
+
     # Load DGL partition data
     partition_data = sar.load_dgl_partition_data(
-        partitioning_json_file, args.rank, args.disable_cut_edges, device)
+        partitioning_json_file, args.rank, device)
 
     # Obtain train,validation, and test masks
     # These are stored as node features. Partitioning may prepend
@@ -169,7 +162,6 @@ def main():
     
     features = sar.suffix_key_lookup(partition_data.node_features, 'features').to(device)
     full_graph_manager = sar.construct_full_graph(partition_data).to(device)
-    # full_graph_manager = sar.construct_full_graph(partition_data, args.partitions).to(device)
 
     #We do not need the partition data anymore
     del partition_data
@@ -193,15 +185,20 @@ def main():
     for train_iter_idx in range(args.train_iters):
         # Train
         t_1 = time.time()
+        # if train_iter_idx == 0:
         logits = gnn_model(full_graph_manager, features)
         loss = F.cross_entropy(logits[masks['train_indices']],
-                               labels[masks['train_indices']], reduction='sum')/n_train_points
+                            labels[masks['train_indices']], reduction='sum')/n_train_points
 
         optimizer.zero_grad()
         loss.backward()
-        # Do not forget to gather the parameter gradients from all workers
+        # # Do not forget to gather the parameter gradients from all workers
+        for param in gnn_model.parameters():
+            param.grad.zero_()
+            # print(param.grad)
+
         sar.gather_grads(gnn_model)
-        optimizer.step()
+        # optimizer.step()
         train_time = time.time() - t_1
 
         # Calculate accuracy for train/validation/test
@@ -223,7 +220,7 @@ def main():
             f"iteration [{train_iter_idx}/{args.train_iters}] | "
         )
         result_message += ', '.join([
-            f"train loss={loss:.4f}, "
+            # f"train loss={loss:.4f}, "
             f"Accuracy: "
             f"train={train_acc:.4f} "
             f"valid={val_acc:.4f} "

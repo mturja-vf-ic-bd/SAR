@@ -29,6 +29,8 @@ from torch import nn
 import torch.distributed as dist
 #from torch.utils.tensorboard import SummaryWriter
 import dgl  # type: ignore
+from datetime import datetime
+import json
 
 import sar
 from sar.core.compressor import \
@@ -50,6 +52,8 @@ parser.add_argument(
 parser.add_argument('--ip-file', default='./ip_file', type=str,
                     help='File with ip-address. Worker 0 creates this file and all others read it ')
 
+parser.add_argument('--output_dir', default='./experiments', type=str,
+                    help=' Saving folder ')
 
 parser.add_argument('--log-level', default='INFO', type=str,
                     choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
@@ -323,6 +327,18 @@ def main():
     args = parser.parse_args()
     print('args', args)
 
+    args.output_dir = os.path.join(args.output_dir ,'world_size_' + str(args.world_size) + 'compression_' + args.compression_type + datetime.now().strftime("%Y-%m%d-%H%M%S") )
+    os.makedirs(os.path.join(args.output_dir), exist_ok=True)
+
+    # Save the dict
+    if args.rank == 0:
+        print('Args:')
+        for k, v in sorted(vars(args).items()):
+            print(f'\t{k}: {v}')
+
+        with open(os.path.join(args.output_dir, 'args.json'), 'w') as f:
+            json.dump(args.__dict__, f, indent=2)
+
     # Patch DGL's attention-based layers and RelGraphConv to support distributed graphs
     sar.patch_dgl()
 
@@ -367,8 +383,10 @@ def main():
                          args.backend, comm_device)
 
     # Load DGL partition data
+    partitioning_json_file = os.path.join('partition_data','ogbn-arxiv',str(args.world_size),args.partitioning_json_file)
+
     partition_data = sar.load_dgl_partition_data(
-        args.partitioning_json_file, args.rank, device)
+        partitioning_json_file, args.rank, device)
 
     # Obtain train,validation, and test masks
     # These are stored as node features. Partitioning may prepend
@@ -579,7 +597,9 @@ def main():
 #        disc = [((x-y)**2).sum() for x, y in zip(
 #            full_graph_manager._compression_decompression.parameters(), orig_comp_params)]
 #        print('comp decomp disc', disc)
-
+        with open(os.path.join(args.output_dir, 'loss.txt'), 'a') as f:
+            f.write(result_message+'\n')
+            f.close()
 
 if __name__ == '__main__':
     main()

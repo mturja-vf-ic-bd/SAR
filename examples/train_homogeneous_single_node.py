@@ -31,6 +31,7 @@ import dgl  # type: ignore
 from datetime import datetime
 import json
 import sar
+from sar.core import GraphShardManager, GraphShard
 
 
 parser = ArgumentParser(
@@ -118,7 +119,7 @@ def main():
     # Make sure that there are more partitions than agents in the world.
     assert(args.partitions >= args.world_size)
 
-    args.output_dir = os.path.join(args.output_dir ,'partitions_'+str(args.partitions)+'_world_size_'+str(args.world_size)+'_'+ datetime.now().strftime("%Y-%m%d-%H%M") )
+    args.output_dir = os.path.join(args.output_dir ,'partitions_'+str(args.partitions)+'_single_node_'+ datetime.now().strftime("%Y-%m%d-%H%M") )
     os.makedirs(os.path.join(args.output_dir), exist_ok=True)
 
     # Save the dict
@@ -136,7 +137,7 @@ def main():
     # Obtain the ip address of the master through the network file system
     master_ip_address = sar.nfs_ip_init(args.rank, args.ip_file)
     sar.initialize_comms(args.rank,
-                         args.world_size, master_ip_address,
+                         1, master_ip_address,
                          args.backend)
 
 
@@ -164,12 +165,18 @@ def main():
 
     # Obtain the number of classes by finding the max label across all workers
     num_labels = labels.max() + 1
-    sar.comm.all_reduce(num_labels, dist.ReduceOp.MAX, move_to_comm_device=True)
+    # sar.comm.all_reduce(num_labels, dist.ReduceOp.MAX, move_to_comm_device=True)
     num_labels = num_labels.item() 
     
-    features = sar.suffix_key_lookup(partition_data.node_features, 'features').to(device)
+    # features = sar.suffix_key_lookup(partition_data.node_features, 'features').to(device)
+    matched_keys = [k for k in partition_data.node_features if k.endswith('features')]
+    if len(matched_keys) == 0:
+        return torch.LongTensor([])
+    assert len(matched_keys) == 1
+    features = partition_data.node_features[matched_keys[0]]
+    print(type(partition_data))
     full_graph_manager = sar.construct_full_graph(partition_data).to(device)
-    # full_graph_manager = sar.construct_full_graph(partition_data, args.partitions).to(device)
+
 
     #We do not need the partition data anymore
     del partition_data
@@ -180,13 +187,13 @@ def main():
     print('model', gnn_model)
 
     # Synchronize the model parmeters across all workers
-    sar.sync_params(gnn_model)
+    # sar.sync_params(gnn_model)
 
     # Obtain the number of labeled nodes in the training
     # This will be needed to properly obtain a cross entropy loss
     # normalized by the number of training examples
     n_train_points = torch.LongTensor([masks['train_indices'].numel()])
-    sar.comm.all_reduce(n_train_points, op=dist.ReduceOp.SUM, move_to_comm_device=True)
+    # sar.comm.all_reduce(n_train_points, op=dist.ReduceOp.SUM, move_to_comm_device=True)
     n_train_points = n_train_points.item()
 
     optimizer = torch.optim.Adam(gnn_model.parameters(), lr=args.lr)
@@ -200,7 +207,7 @@ def main():
         optimizer.zero_grad()
         loss.backward()
         # Do not forget to gather the parameter gradients from all workers
-        sar.gather_grads(gnn_model)
+        # sar.gather_grads(gnn_model)
         optimizer.step()
         train_time = time.time() - t_1
 
@@ -213,7 +220,7 @@ def main():
 
         acc_vec = torch.FloatTensor(results)
         # Sum the n_correct, and number of mask elements across all workers
-        sar.comm.all_reduce(acc_vec, op=dist.ReduceOp.SUM, move_to_comm_device=True)
+        # sar.comm.all_reduce(acc_vec, op=dist.ReduceOp.SUM, move_to_comm_device=True)
         (train_acc, val_acc, test_acc) =  \
             (acc_vec[0] / acc_vec[1],
              acc_vec[2] / acc_vec[3],

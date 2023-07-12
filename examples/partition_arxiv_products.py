@@ -59,7 +59,6 @@ parser.add_argument(
 
 def main():
     args = parser.parse_args()
-    print('here', args.dataset_root)
     dataset = DglNodePropPredDataset(name=args.dataset_name,
                                      root=args.dataset_root)
     # dataset = PygNodePropPredDataset(name=args.dataset_name,

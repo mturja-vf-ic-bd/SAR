@@ -34,6 +34,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 from .config import Config
+from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -193,9 +194,8 @@ def initialize_comms(_rank: int, _world_size: int, master_ip_address: str,
 
     os.environ['I_MPI_COMM_WORLD'] = str(_world_size)
     os.environ['I_MPI_COMM_RANK'] = str(_rank)
-
     dist.init_process_group(
-        backend=backend, rank=_rank, world_size=_world_size)
+        backend=backend, rank=_rank, world_size=_world_size,timeout = timedelta(seconds=180))
 
     _CommData.rank = _rank
     _CommData.world_size = _world_size
