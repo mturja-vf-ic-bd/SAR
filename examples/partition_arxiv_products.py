@@ -43,12 +43,20 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--part-method",
+    type=str,
+    default="random",
+    choices=['random', 'metis'],
+    help=" Form of graph partition. "
+)
+
+
+parser.add_argument(
     "--partition-out-path",
     type=str,
     default="./partition_data/",
     help="Path to the output directory for the partition data "
 )
-
 
 parser.add_argument(
     '--num-partitions',
@@ -84,7 +92,7 @@ def main():
                          [train_mask, val_mask, test_mask, labels, features]):
         graph.ndata[name] = val
 
-    path_to_save = os.path.join(args.partition_out_path, args.dataset_name , str(args.num_partitions) )
+    path_to_save = os.path.join(args.partition_out_path , args.part_method , args.dataset_name , str(args.num_partitions) )
 
     dgl.distributed.partition_graph(
         graph, args.dataset_name,
@@ -93,7 +101,8 @@ def main():
         num_hops=1,
         reshuffle=True,
         balance_ntypes=train_mask,
-        balance_edges=True)
+        balance_edges=True,
+        part_method=args.part_method)
 
 
 if __name__ == '__main__':

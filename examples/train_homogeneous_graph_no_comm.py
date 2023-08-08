@@ -30,7 +30,7 @@ import torch.distributed as dist
 import dgl  # type: ignore
 from datetime import datetime
 import json
-import sar
+# import sar
 
 
 parser = ArgumentParser(
@@ -47,7 +47,7 @@ parser.add_argument(
 parser.add_argument('--ip-file', default='./ip_file', type=str,
                     help='File with ip-address. Worker 0 creates this file and all others read it ')
 
-parser.add_argument('--output_dir', default='./experiments', type=str,
+parser.add_argument('--output-dir', default='./experiments', type=str,
                     help=' Saving folder ')
 
 parser.add_argument('--backend', default='nccl', type=str, choices=['ccl', 'nccl', 'mpi'],
@@ -59,6 +59,10 @@ parser.add_argument(
     help="Run on CPUs if set, otherwise run on GPUs "
 )
 
+# parser.add_argument(
+#     "--disable-cut-edges", action="store_false",
+#     help="Disable Communication "
+# )
 
 parser.add_argument('--train-iters', default=100, type=int,
                     help='number of training iterations ')
@@ -77,9 +81,27 @@ parser.add_argument('--rank', default=0, type=int,
 parser.add_argument('--world-size', default=2, type=int,
                     help='Number of workers ')
 
+parser.add_argument('--partitions', default=0, type=int,
+                    help='Number of partitions. By default it will be equal to world-size.')
+
 parser.add_argument('--hidden-layer-dim', default=256, type=int,
                     help='Dimension of GNN hidden layer')
 
+parser.add_argument(
+    "--part-method",
+    type=str,
+    default="random",
+    choices=['random', 'metis'],
+    help=" Form of graph partition. "
+)
+
+parser.add_argument(
+    "--dataset-name",
+    type=str,
+    default="ogbn-arxiv",
+    choices=['ogbn-arxiv', 'ogbn-products'],
+    help="Dataset name. ogbn-arxiv or ogbn-products "
+)
 
 class GNNModel(nn.Module):
     def __init__(self,  in_dim: int, hidden_dim: int, out_dim: int):
@@ -93,20 +115,32 @@ class GNNModel(nn.Module):
             # pylint: disable=no-member
             dgl.nn.SAGEConv(hidden_dim, out_dim, aggregator_type='mean'),
         ])
+        self.top = nn.Sequential(
+                                nn.BatchNorm1d(hidden_dim),
+                                # nn.ReLU(),
+                                nn.Dropout(0.5),
+        )
 
+    
     def forward(self,  graph: sar.GraphShardManager, features: torch.Tensor):
         for idx, conv in enumerate(self.convs):
             features = conv(graph, features)
             if idx < len(self.convs) - 1:
-                features = F.relu(features, inplace=True)
-
+                features = self.top(features)
+            features = F.relu(features, inplace=True)
+            
         return features
 
 
 def main():
     args = parser.parse_args()
+    # Make the number of partitions equal to the world size
+    if args.partitions == 0:
+        args.partitions = args.world_size
+    # Make sure that there are more partitions than agents in the world.
+    assert(args.partitions >= args.world_size)
 
-    args.output_dir = os.path.join(args.output_dir ,'world_size_'+str(args.world_size)+'_'+ datetime.now().strftime("%Y-%m%d-%H%M%S") )
+    args.output_dir = os.path.join(args.output_dir, args.dataset_name,args.part_method,'disable_comm_'+str(args.disable_cut_edges)+'_partitions_'+str(args.partitions)+'_world_size_'+str(args.world_size)+'_'+ datetime.now().strftime("%Y-%m%d-%H%M") )
     os.makedirs(os.path.join(args.output_dir), exist_ok=True)
 
     # Save the dict
@@ -128,16 +162,11 @@ def main():
                          args.backend)
 
 
-    partitioning_json_file = os.path.join('partition_data','ogbn-arxiv',str(args.world_size),args.partitioning_json_file)
-
-    # Remove all edges incoming to your partition.
-    # Run code exactly as is. 
-
-    # What if I use compression rate very high. 
-
+    partitioning_json_file = os.path.join('partition_data',args.part_method,args.dataset_name,str(args.partitions),args.partitioning_json_file)
+    
     # Load DGL partition data
     partition_data = sar.load_dgl_partition_data(
-        partitioning_json_file, args.rank, device)
+        partitioning_json_file, args.rank, args.disable_cut_edges, device)
 
     # Obtain train,validation, and test masks
     # These are stored as node features. Partitioning may prepend
@@ -162,6 +191,7 @@ def main():
     
     features = sar.suffix_key_lookup(partition_data.node_features, 'features').to(device)
     full_graph_manager = sar.construct_full_graph(partition_data).to(device)
+    # full_graph_manager = sar.construct_full_graph(partition_data, args.partitions).to(device)
 
     #We do not need the partition data anymore
     del partition_data
@@ -185,28 +215,26 @@ def main():
     for train_iter_idx in range(args.train_iters):
         # Train
         t_1 = time.time()
-        # if train_iter_idx == 0:
         logits = gnn_model(full_graph_manager, features)
         loss = F.cross_entropy(logits[masks['train_indices']],
-                            labels[masks['train_indices']], reduction='sum')/n_train_points
+                               labels[masks['train_indices']], reduction='sum')/n_train_points
 
         optimizer.zero_grad()
         loss.backward()
-        # # Do not forget to gather the parameter gradients from all workers
-        for param in gnn_model.parameters():
-            param.grad.zero_()
-            # print(param.grad)
-
+        # Do not forget to gather the parameter gradients from all workers
         sar.gather_grads(gnn_model)
-        # optimizer.step()
+        optimizer.step()
         train_time = time.time() - t_1
 
         # Calculate accuracy for train/validation/test
         results = []
-        for indices_name in ['train_indices', 'val_indices', 'test_indices']:
-            n_correct = (logits[masks[indices_name]].argmax(1) ==
-                         labels[masks[indices_name]]).float().sum()
-            results.extend([n_correct, masks[indices_name].numel()])
+        gnn_model.eval()
+        with torch.no_grad():
+            for indices_name in ['train_indices', 'val_indices', 'test_indices']:
+                n_correct = (logits[masks[indices_name]].argmax(1) ==
+                            labels[masks[indices_name]]).float().sum()
+                results.extend([n_correct, masks[indices_name].numel()])
+        gnn_model.train()
 
         acc_vec = torch.FloatTensor(results)
         # Sum the n_correct, and number of mask elements across all workers
@@ -220,7 +248,7 @@ def main():
             f"iteration [{train_iter_idx}/{args.train_iters}] | "
         )
         result_message += ', '.join([
-            # f"train loss={loss:.4f}, "
+            f"train loss={loss:.4f}, "
             f"Accuracy: "
             f"train={train_acc:.4f} "
             f"valid={val_acc:.4f} "

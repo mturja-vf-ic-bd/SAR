@@ -47,7 +47,7 @@ parser.add_argument(
 parser.add_argument('--ip-file', default='./ip_file', type=str,
                     help='File with ip-address. Worker 0 creates this file and all others read it ')
 
-parser.add_argument('--output_dir', default='./experiments', type=str,
+parser.add_argument('--output-dir', default='./experiments', type=str,
                     help=' Saving folder ')
 
 parser.add_argument('--backend', default='nccl', type=str, choices=['ccl', 'nccl', 'mpi'],
@@ -60,7 +60,7 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--disable_cut_edges", action="store_false",
+    "--disable-cut-edges", action="store_false",
     help="Disable Communication "
 )
 
@@ -87,28 +87,86 @@ parser.add_argument('--partitions', default=0, type=int,
 parser.add_argument('--hidden-layer-dim', default=256, type=int,
                     help='Dimension of GNN hidden layer')
 
+parser.add_argument(
+    "--part-method",
+    type=str,
+    default="random",
+    choices=['random', 'metis'],
+    help=" Form of graph partition. "
+)
 
-class GNNModel(nn.Module):
+parser.add_argument(
+    "--dataset-name",
+    type=str,
+    default="ogbn-arxiv",
+    choices=['ogbn-arxiv', 'ogbn-products'],
+    help="Dataset name. ogbn-arxiv or ogbn-products "
+)
+
+# class GNNModel(nn.Module):
+#     def __init__(self,  in_dim: int, hidden_dim: int, out_dim: int):
+#         super().__init__()
+
+#         self.convs = nn.ModuleList([
+#             # pylint: disable=no-member
+#             dgl.nn.SAGEConv(in_dim, hidden_dim, aggregator_type='mean'),
+#             # pylint: disable=no-member
+#             dgl.nn.SAGEConv(hidden_dim, hidden_dim, aggregator_type='mean'),
+#             # pylint: disable=no-member
+#             dgl.nn.SAGEConv(hidden_dim, out_dim, aggregator_type='mean'),
+#         ])
+#         self.top = nn.Sequential(
+#                                 nn.BatchNorm1d(hidden_dim),
+#                                 # nn.ReLU(),
+#                                 nn.Dropout(0.5),
+#         )
+
+    
+#     def forward(self,  graph: sar.GraphShardManager, features: torch.Tensor):
+#         for idx, conv in enumerate(self.convs):
+#             features = conv(graph, features)
+#             if idx < len(self.convs) - 1:
+#                 features = self.top(features)
+#             features = F.relu(features, inplace=True)
+            
+#         return features
+
+class GNNModel(torch.nn.Module):
     def __init__(self,  in_dim: int, hidden_dim: int, out_dim: int):
-        super().__init__()
 
-        self.convs = nn.ModuleList([
-            # pylint: disable=no-member
-            dgl.nn.SAGEConv(in_dim, hidden_dim, aggregator_type='mean'),
-            # pylint: disable=no-member
-            dgl.nn.SAGEConv(hidden_dim, hidden_dim, aggregator_type='mean'),
-            # pylint: disable=no-member
-            dgl.nn.SAGEConv(hidden_dim, out_dim, aggregator_type='mean'),
-        ])
+        super(GNNModel, self).__init__()
+        # To do - parameterize this
+        self.dropout = 0.5
+        self.num_layers = 3
 
-    def forward(self,  graph: sar.GraphShardManager, features: torch.Tensor):
-        for idx, conv in enumerate(self.convs):
-            features = conv(graph, features)
-            if idx < len(self.convs) - 1:
-                features = F.relu(features, inplace=True)
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(dgl.nn.SAGEConv(in_dim, hidden_dim, aggregator_type='mean'))
+        self.bns = torch.nn.ModuleList()
+        # self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+        self.bns.append(sar.DistributedBN1D(hidden_dim, affine=True))
 
-        return features
+        for _ in range(self.num_layers - 2):
+            self.convs.append(dgl.nn.SAGEConv(hidden_dim, hidden_dim, aggregator_type='mean'))
+            # self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+            self.bns.append(sar.DistributedBN1D(hidden_dim, affine=True))
 
+        self.convs.append(dgl.nn.SAGEConv(hidden_dim, out_dim, aggregator_type='mean'))
+
+
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+        for bn in self.bns:
+            bn.reset_parameters()
+
+    def forward(self, adj_t, x):
+        for i, conv in enumerate(self.convs[:-1]):
+            x = conv(adj_t, x)
+            x = self.bns[i](x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.convs[-1](adj_t, x)
+        return x.log_softmax(dim=-1)
 
 def main():
     args = parser.parse_args()
@@ -118,7 +176,7 @@ def main():
     # Make sure that there are more partitions than agents in the world.
     assert(args.partitions >= args.world_size)
 
-    args.output_dir = os.path.join(args.output_dir ,'partitions_'+str(args.partitions)+'_world_size_'+str(args.world_size)+'_'+ datetime.now().strftime("%Y-%m%d-%H%M") )
+    args.output_dir = os.path.join(args.output_dir, args.dataset_name,args.part_method,'disable_comm_'+str(args.disable_cut_edges)+'_partitions_'+str(args.partitions)+'_world_size_'+str(args.world_size)+'_'+ datetime.now().strftime("%Y-%m%d-%H%M") )
     os.makedirs(os.path.join(args.output_dir), exist_ok=True)
 
     # Save the dict
@@ -140,7 +198,7 @@ def main():
                          args.backend)
 
 
-    partitioning_json_file = os.path.join('partition_data','ogbn-arxiv',str(args.partitions),args.partitioning_json_file)
+    partitioning_json_file = os.path.join('partition_data',args.part_method,args.dataset_name,str(args.partitions),args.partitioning_json_file)
     
     # Load DGL partition data
     partition_data = sar.load_dgl_partition_data(
@@ -206,10 +264,13 @@ def main():
 
         # Calculate accuracy for train/validation/test
         results = []
-        for indices_name in ['train_indices', 'val_indices', 'test_indices']:
-            n_correct = (logits[masks[indices_name]].argmax(1) ==
-                         labels[masks[indices_name]]).float().sum()
-            results.extend([n_correct, masks[indices_name].numel()])
+        gnn_model.eval()
+        with torch.no_grad():
+            for indices_name in ['train_indices', 'val_indices', 'test_indices']:
+                n_correct = (logits[masks[indices_name]].argmax(1) ==
+                            labels[masks[indices_name]]).float().sum()
+                results.extend([n_correct, masks[indices_name].numel()])
+        gnn_model.train()
 
         acc_vec = torch.FloatTensor(results)
         # Sum the n_correct, and number of mask elements across all workers
