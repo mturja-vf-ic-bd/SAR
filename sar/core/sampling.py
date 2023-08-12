@@ -147,7 +147,8 @@ class DistNeighborSampler:
     :type output_node_features: Optional[Dict[str, Tensor]]
     :param output_device: The output device
     :type output_device:
-
+    :param local_only: If True, uses only local node features to learn the representation
+    :type local_only: Optional[bool]
     """
 
     def __init__(self, fanouts: List[int],  prob: Optional[str] = None,
@@ -156,7 +157,8 @@ class DistNeighborSampler:
                  input_node_features: Optional[Dict[str, Tensor]] = None,
                  output_node_features: Optional[Dict[str, Tensor]] = None,
                  output_device: Optional[torch.device] = None,
-                 compression_decompression=None):
+                 compression_decompression = None,
+                 local_only: Optional[bool] = False):
         self.fanouts = fanouts
         self.prob = prob
         self.replace = replace
@@ -174,6 +176,7 @@ class DistNeighborSampler:
         self.input_node_features = input_node_features
         self.output_node_features = output_node_features
         self.output_device = output_device
+        self.local_only = local_only
 
     def _sample_local(self, sampling_graph: DGLGraph,
                       fanout: int,
@@ -187,60 +190,73 @@ class DistNeighborSampler:
                             input_nodes,
                             node_ranges):
         if self.input_node_features is not None:
-            per_partition_indices = [
-                torch.logical_and(input_nodes >= start_idx,
-                                  input_nodes < end_idx).nonzero(as_tuple=True)[0]
-                for start_idx, end_idx in node_ranges]
-            per_partition_input_nodes = [
-                input_nodes[indices] - start_idx
-                for indices, (start_idx, _) in zip(per_partition_indices, node_ranges)]
-            local_nodes = per_partition_input_nodes[rank()]
-            per_partition_input_nodes[rank()] = local_nodes.new(0)
-            t1 = time.time()
-            requested_nodes = exchange_tensors(per_partition_input_nodes)
-            t2 = time.time()
-            print('exchange input features required indices', t2 - t1)
-            for feature_name in self.input_node_features:
-                feature_tensor = self.input_node_features[feature_name]
-                requested_features = [feature_tensor[indices]
-                                      for indices in requested_nodes]
+            if self.local_only:
+                for feature_name in self.input_node_features:
+                    feature_tensor = self.input_node_features[feature_name]
+                    graph_input_tensor = feature_tensor.new(
+                        len(input_nodes), *feature_tensor.size()[1:]).zero_()
+                    local_input_nodes_pos = torch.logical_and(
+                        input_nodes >= node_ranges[rank()][0],
+                        input_nodes < node_ranges[rank()][1])
+                    graph_input_tensor[local_input_nodes_pos] = feature_tensor[
+                        input_nodes[local_input_nodes_pos] - node_ranges[rank()][0]]
+                    sampled_block.srcdata[feature_name] = graph_input_tensor.to(
+                        sampled_block.device)
+            else:
+                per_partition_indices = [
+                    torch.logical_and(input_nodes >= start_idx,
+                                    input_nodes < end_idx).nonzero(as_tuple=True)[0]
+                    for start_idx, end_idx in node_ranges]
+                per_partition_input_nodes = [
+                    input_nodes[indices] - start_idx
+                    for indices, (start_idx, _) in zip(per_partition_indices, node_ranges)]
+                local_nodes = per_partition_input_nodes[rank()]
+                per_partition_input_nodes[rank()] = local_nodes.new(0)
                 t1 = time.time()
-                if self.compression_decompression is not None:
-                    with torch.no_grad():
-                        compressed_requested_features = self.compression_decompression.compress(
-                            requested_features, iter=Config.train_iter)
-                    compressed_feat_dim = compressed_requested_features[(
-                        rank() + 1) % (world_size())].size(1)
-
-                    compressed_requested_features[rank()] = compressed_requested_features[rank(
-                    )][:, :compressed_feat_dim]
-
-                    tz = time.time()
-                    print('compressed requested feature size', [
-                          x.size() for x in compressed_requested_features])
-                    compressed_fetched_node_features = exchange_tensors(
-                        compressed_requested_features)
-                    print('communication of compressed tensors', time.time() - tz)
-                    with torch.no_grad():
-                        fetched_node_features = self.compression_decompression.decompress(
-                            compressed_fetched_node_features)
-                else:
-                    fetched_node_features = exchange_tensors(
-                        requested_features)
+                requested_nodes = exchange_tensors(per_partition_input_nodes)
                 t2 = time.time()
-                print('exchange actual input features', t2 - t1)
-                Config.comm_time_forward += time.time() - t1
-                graph_input_tensor = feature_tensor.new(
-                    len(input_nodes), *feature_tensor.size()[1:])
-                for part_idx in range(len(fetched_node_features)):
-                    if part_idx == rank():
-                        graph_input_tensor[per_partition_indices[part_idx]
-                                           ] = feature_tensor[local_nodes]
+                print('exchange input features required indices', t2 - t1)
+                for feature_name in self.input_node_features:
+                    feature_tensor = self.input_node_features[feature_name]
+                    requested_features = [feature_tensor[indices]
+                                        for indices in requested_nodes]
+                    t1 = time.time()
+                    if self.compression_decompression is not None:
+                        with torch.no_grad():
+                            compressed_requested_features = self.compression_decompression.compress(
+                                requested_features, iter=Config.train_iter)
+                        compressed_feat_dim = compressed_requested_features[(
+                            rank() + 1) % (world_size())].size(1)
+
+                        compressed_requested_features[rank()] = compressed_requested_features[rank(
+                        )][:, :compressed_feat_dim]
+
+                        tz = time.time()
+                        print('compressed requested feature size', [
+                            x.size() for x in compressed_requested_features])
+                        compressed_fetched_node_features = exchange_tensors(
+                            compressed_requested_features)
+                        print('communication of compressed tensors', time.time() - tz)
+                        with torch.no_grad():
+                            fetched_node_features = self.compression_decompression.decompress(
+                                compressed_fetched_node_features)
                     else:
-                        graph_input_tensor[per_partition_indices[part_idx]
-                                           ] = fetched_node_features[part_idx]
-                sampled_block.srcdata[feature_name] = graph_input_tensor.to(
-                    sampled_block.device)
+                        fetched_node_features = exchange_tensors(
+                            requested_features)
+                    t2 = time.time()
+                    print('exchange actual input features', t2 - t1)
+                    Config.comm_time_forward += time.time() - t1
+                    graph_input_tensor = feature_tensor.new(
+                        len(input_nodes), *feature_tensor.size()[1:])
+                    for part_idx in range(len(fetched_node_features)):
+                        if part_idx == rank():
+                            graph_input_tensor[per_partition_indices[part_idx]
+                                            ] = feature_tensor[local_nodes]
+                        else:
+                            graph_input_tensor[per_partition_indices[part_idx]
+                                            ] = fetched_node_features[part_idx]
+                    sampled_block.srcdata[feature_name] = graph_input_tensor.to(
+                        sampled_block.device)
 
     def _add_output_features(self, sampled_block: DGLBlock, output_nodes: Tensor,
                              node_ranges: List[Tuple[int, int]]):

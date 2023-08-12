@@ -56,7 +56,7 @@ parser.add_argument('--ip-file', default='./ip_file', type=str,
                     help='File with ip-address. Worker 0 creates this file and all others read it ')
 
 
-parser.add_argument('--backend', default='nccl', type=str, choices=['ccl', 'nccl', 'mpi'],
+parser.add_argument('--backend', default='nccl', type=str, choices=['ccl', 'nccl', 'mpi', 'gloo'],
                     help='Communication backend to use '
                     )
 
@@ -83,6 +83,10 @@ parser.add_argument(
     default="",
     help="Prefix of the files used to store precomputed batches "
 )
+
+# Newly added arguments to enable training with local features
+parser.add_argument('--local_only', action='store_true',
+                    default=False, help='Use only local node features')
 
 # Newly added arguments for compression decompression module
 parser.add_argument('--enable_cr', action='store_true',
@@ -285,7 +289,8 @@ def main():
                                                              output_node_features={
                                                                  'labels': labels},
                                                              output_device=device,
-                                                             compression_decompression=comp_mod
+                                                             compression_decompression=comp_mod,
+                                                             local_only=args.local_only
                                                              )
 
     train_nodes = masks['train_indices'] + node_ranges[sar.rank()][0]
@@ -306,6 +311,10 @@ def main():
 
     for k in list(masks.keys()):
         masks[k] = masks[k].to(device)
+    
+    best_val_acc = -1
+    test_acc_final = 0
+    train_acc_final = 0
 
     for train_iter_idx in range(args.train_iters):
         Config.train_iter = train_iter_idx
@@ -380,16 +389,11 @@ def main():
                 f"iteration [{train_iter_idx}/{args.train_iters}] | "
             )
             result_message += ', '.join([
-                f"Loss: "
-                f"train={0.0:.4f}, "
-                f"valid={0.0:.4f} "
-                f"test={0.0:.4f} "
-                f" | "
                 f"Accuracy: "
                 f"train={train_acc:.4f} "
                 f"valid={val_acc:.4f} "
                 f"test={test_acc:.4f} "
-                f"model={test_acc:.4f}"
+                f"model={test_acc_final:.4f}"
                 f" | train time = {train_time} "
                 f" | forward comm  time = {Config.comm_time_forward} "
                 f" | backward comm  time = {Config.comm_time_backward} "
@@ -398,6 +402,15 @@ def main():
             ])
             print(result_message, flush=True)
 
+            # Storing the score based on best validation score
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                test_acc_final = test_acc
+                train_acc_final = train_acc
+    print(f"Final result: \nAccuracy" 
+          f"train={train_acc_final:.4f}, ", 
+          f"valid={best_val_acc:.4f}, ", 
+          f"test={test_acc_final:.4f}")
 
 if __name__ == '__main__':
     main()

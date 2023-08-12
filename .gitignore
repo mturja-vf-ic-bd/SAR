@@ -1,0 +1,8 @@
+datasets/*
+examples/run_homogeneous_sampling.py
+*/__pycache__/
+__pycache__/
+partition_data/
+*txt
+run.sh
+ip_file

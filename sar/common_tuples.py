@@ -21,7 +21,7 @@
 '''
 Tuples for grouping related data
 '''
-from typing import NamedTuple, Dict, Tuple, List, Any, TYPE_CHECKING
+from typing import NamedTuple, Dict, Tuple, List, Optional, Any, TYPE_CHECKING
 from enum import Enum
 from torch import Tensor
 
@@ -121,3 +121,8 @@ class ShardInfo(NamedTuple):
     src_node_range: Tuple[int, int]
     tgt_node_range: Tuple[int, int]
     edge_range: Tuple[int, int]
+
+
+class SocketInfo(NamedTuple):
+    name: str
+    ip_addr: str
