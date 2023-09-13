@@ -142,13 +142,13 @@ class GNNModel(torch.nn.Module):
         self.convs = torch.nn.ModuleList()
         self.convs.append(dgl.nn.SAGEConv(in_dim, hidden_dim, aggregator_type='mean'))
         self.bns = torch.nn.ModuleList()
-        # self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
-        self.bns.append(sar.DistributedBN1D(hidden_dim, affine=True))
+        self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+        # self.bns.append(sar.DistributedBN1D(hidden_dim, affine=True))
 
         for _ in range(self.num_layers - 2):
             self.convs.append(dgl.nn.SAGEConv(hidden_dim, hidden_dim, aggregator_type='mean'))
-            # self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
-            self.bns.append(sar.DistributedBN1D(hidden_dim, affine=True))
+            self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+            # self.bns.append(sar.DistributedBN1D(hidden_dim, affine=True))
 
         self.convs.append(dgl.nn.SAGEConv(hidden_dim, out_dim, aggregator_type='mean'))
 

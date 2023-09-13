@@ -49,6 +49,27 @@ parser.add_argument(
     help="Path to the .json file containing partitioning information "
 )
 
+parser.add_argument(
+    "--dataset-name",
+    type=str,
+    default="ogbn-arxiv",
+    choices=['ogbn-arxiv', 'ogbn-products'],
+    help="Dataset name. ogbn-arxiv or ogbn-products "
+)
+
+parser.add_argument(
+    "--disable-cut-edges", action="store_true",
+    help="If present, disables communication "
+)
+
+parser.add_argument(
+    "--part-method",
+    type=str,
+    default="random",
+    choices=['random', 'metis'],
+    help=" Form of graph partition. "
+)
+
 parser.add_argument('--ip-file', default='./ip_file', type=str,
                     help='File with ip-address. Worker 0 creates this file and all others read it ')
 
@@ -110,6 +131,9 @@ parser.add_argument('--rank', default=-1, type=int,
 parser.add_argument('--world-size', default=-1, type=int,
                     help='Number of workers ')
 
+parser.add_argument('--partitions', default=0, type=int,
+                    help='Number of partitions. By default it will be equal to world-size.')
+
 parser.add_argument('--n-layers', default=3, type=int,
                     help='Number of GNN layers ')
 
@@ -122,7 +146,7 @@ parser.add_argument('--n_kernel', default=None, type=int,
 parser.add_argument('--log_dir', default="log", type=str,
                     help='Parent directory for logging')
 
-parser.add_argument('--fed_agg_round', default=501, type=int,
+parser.add_argument('--fed_agg_round', default=1, type=int,
                     help='number of training iterations after \
                         which weights across clients will \
                             be aggregated')
@@ -135,7 +159,7 @@ parser.add_argument('--enable_cr', action='store_true',
 parser.add_argument('--comp_ratio', default=None, type=int,
                     help="Compression ratio for sub-graph based compression")
 
-parser.add_argument('--min_comp_ratio', default=None, type=int,
+parser.add_argument('--min_comp_ratio', default=None, type=float,
                     help="min Compression ratio for variable feature-based compression")
 
 parser.add_argument('--max_comp_ratio', default=None, type=int,
@@ -152,6 +176,8 @@ parser.add_argument('--compression_step', default=None, type=int,
                     help="Number of training iteration after which compression ratio \
                         changes for variable compression ratio")
 
+parser.add_argument('--variable_compression_slope', default=1, type=int,
+                    help="Slope of the linear compression")
 
 class GNNModel(nn.Module):
     def __init__(self,  gnn_layer: str, n_layers: int, layer_dim: int,
@@ -187,7 +213,7 @@ class GNNModel(nn.Module):
             t1 = time.time()
             features = conv(blocks[idx], features)
             t2 = time.time() - t1
-            print(f'total conv time {t2}', flush=True)
+            # print(f'total conv time {t2}', flush=True)
             if features.ndim == 3:  # GAT produces an extra n_heads dimension
                 # collapse the n_heads dimension
                 features = features.mean(1)
@@ -288,7 +314,8 @@ def train_pass(gnn_model: torch.nn.Module,
     gnn_model.train()
     t1 = time.time()
     logits = gnn_model(train_blocks, features)
-    print('forward time ', time.time() - t1, flush=True)
+    Config.comm_time_forward = time.time() - t1
+    # print('forward time ', Config.comm_time_forward, flush=True)
 
     if mfg_blocks:
         # By construction, the output nodes of the top layer training MFG are
@@ -307,13 +334,15 @@ def train_pass(gnn_model: torch.nn.Module,
 
     t1 = time.time()
     loss.backward()
-    print('backward time ', time.time() - t1, flush=True)
+    Config.comm_time_backward = time.time() - t1
+    # print('backward time ', Config.comm_time_backward, flush=True)
     # Do not forget to gather the parameter gradients from all workers
     t1 = time.time()
     if (train_iter_idx + 1) % fed_agg_round == 0:
         sar.gather_grads(gnn_model)
-        print("Aggregating models across clients", flush=True)
-    print(f'gather grad time : ', time.time() - t1, flush=True)
+        # print("Aggregating models across clients", flush=True)
+    Config.comm_gather_grads = time.time() - t1
+    # print(f'gather grad time : ', Config.comm_gather_grads , flush=True)
 
 #    pre_comp_grads = [
 #        x.grad for x in train_blocks[0]._compression_decompression.parameters()]
@@ -326,7 +355,7 @@ def train_pass(gnn_model: torch.nn.Module,
 def main():
     args = parser.parse_args()
     print('args', args)
-
+    args.output_dir = os.path.join(args.output_dir, args.compression_type) # Folder with Compression type
     args.output_dir = os.path.join(args.output_dir ,'world_size_' + str(args.world_size) + 'compression_' + args.compression_type + datetime.now().strftime("%Y-%m%d-%H%M%S") )
     os.makedirs(os.path.join(args.output_dir), exist_ok=True)
 
@@ -383,10 +412,16 @@ def main():
                          args.backend, comm_device)
 
     # Load DGL partition data
-    partitioning_json_file = os.path.join('partition_data','ogbn-arxiv',str(args.world_size),args.partitioning_json_file)
+    # partitioning_json_file = os.path.join('partition_data','ogbn-arxiv',str(args.world_size),args.partitioning_json_file)
+    # partitioning_json_file = os.path.join('partition_data',args.part_method,args.dataset_name,str(args.partitions),args.partitioning_json_file)
+    partitioning_json_file = os.path.join('partition_data',args.part_method,args.dataset_name,str(args.partitions),args.partitioning_json_file)
+
+
+    # partition_data = sar.load_dgl_partition_data(
+    #     partitioning_json_file, args.rank, device)
 
     partition_data = sar.load_dgl_partition_data(
-        partitioning_json_file, args.rank, device)
+        partitioning_json_file, args.rank, args.disable_cut_edges, device)
 
     # Obtain train,validation, and test masks
     # These are stored as node features. Partitioning may prepend
@@ -454,6 +489,7 @@ def main():
             feature_dim = [features.size(
                 1)] + [args.layer_dim] * (args.n_layers - 2) + [num_labels]
             if args.compression_type == "feature":
+                print('entered here')
                 comp_mod = FeatureCompressorDecompressor(
                     feature_dim=feature_dim,
                     comp_ratio=[float(args.comp_ratio)] * args.n_layers
@@ -461,6 +497,7 @@ def main():
             elif args.compression_type == "variable":
                 comp_mod = VariableFeatureCompressorDecompressor(
                     feature_dim=feature_dim,
+                    slope=args.variable_compression_slope,
                     min_comp_ratio=args.min_comp_ratio,
                     max_comp_ratio=args.max_comp_ratio
                 )
@@ -542,6 +579,8 @@ def main():
         Config.comm_time_forward = 0
         Config.comm_time_backward = 0
         Config.comp_decomp_time = 0
+        Config.comm_gather_grads = 0
+
         train_pass(gnn_model,
                    optimizer,
                    train_blocks,
@@ -556,6 +595,7 @@ def main():
         comm_time_forward = Config.comm_time_forward
         comm_time_backward = Config.comm_time_backward
         comp_decomp_time = Config.comp_decomp_time
+        comm_gather_grads = Config.comm_gather_grads
 
         (train_loss, train_acc, val_loss, val_acc, test_loss, test_acc) = \
             infer_pass(gnn_model,
@@ -589,11 +629,12 @@ def main():
             f" | train time = {train_time} "
             f" | forward comm  time = {comm_time_forward} "
             f" | backward comm  time = {comm_time_backward} "
-
+            f" | comp decomp  time = {comp_decomp_time} "
+            f" | gather grads time = {comm_gather_grads}"
             f" |"
         ])
         print(result_message, flush=True)
-        print('comp decomp time', comp_decomp_time)
+        # print('comp decomp time', comp_decomp_time)
 #        disc = [((x-y)**2).sum() for x, y in zip(
 #            full_graph_manager._compression_decompression.parameters(), orig_comp_params)]
 #        print('comp decomp disc', disc)

@@ -62,6 +62,7 @@ class FeatureCompressorDecompressor(CompressorDecompressorBase):
         self.decompressors = nn.ModuleDict()
         for i, f in enumerate(feature_dim):
             k = floor(f/comp_ratio[Config.current_layer_index])
+            print(i, k, f, comp_ratio[Config.current_layer_index])
             self.compressors[f"layer_{i}"] = nn.Sequential(
                 nn.Linear(f, k),
                 nn.ReLU()
@@ -97,7 +98,7 @@ class FeatureCompressorDecompressor(CompressorDecompressorBase):
 
 
 class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
-    def __init__(self, feature_dim: List[int], max_comp_ratio: float, min_comp_ratio: float):
+    def __init__(self, feature_dim: List[int], slope: int,max_comp_ratio: float, min_comp_ratio: float):
         """
         A feature-based compression decompression module. The compressor compresses outgoing
         tensor along feature dimension and decompresses it back to original size on the receiving
@@ -115,8 +116,12 @@ class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
         self.feature_dim = feature_dim
         self.compressors = nn.ModuleDict()
         self.decompressors = nn.ModuleDict()
+        self.slope = slope
         self.min_comp_ratio = min_comp_ratio
         self.max_comp_ratio = max_comp_ratio
+        
+
+
         for i, f in enumerate(feature_dim):
             Config.current_layer_index = i
             self.compressors[f"layer_{i}"] = nn.Sequential(
@@ -135,7 +140,8 @@ class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
 
         slope = (self.max_comp_ratio - self.min_comp_ratio) / \
             (Config.total_train_iter-2)
-        current_ratio = self.max_comp_ratio - iter * slope
+        # current_ratio = self.max_comp_ratio - iter * slope
+        current_ratio = self.max_comp_ratio - self.slope * iter * slope
 
 #        current_ratio = self.max_comp_ratio * math.exp(-(iter * math.log(
 #            self.max_comp_ratio/self.min_comp_ratio))/(Config.total_train_iter - 2))
@@ -152,7 +158,7 @@ class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
         else:
             compressed_feature_dim = active_feature_dim
         print(
-            f'compressed feature dim at layer {Config.current_layer_index} : {compressed_feature_dim}')
+            f'compressed feature dim at layer {Config.current_layer_index} : {compressed_feature_dim}', 'iter',iter,current_ratio) #juan added this
         return compressed_feature_dim
 
     def compress(self, tensors_l: List[Tensor], iter: int = 0, scorer_type=None):
@@ -300,6 +306,7 @@ def compute_CR_linear(init_CR, slope, step, iter):
 
 
 def pool(val, score, k):
+    print('pool', val, score, k)
     sel_scores, idx = torch.topk(score, k=k, dim=0)
     idx = idx.squeeze(-1)
     new_val = torch.mul(val[idx, :], sel_scores)
@@ -335,6 +342,7 @@ class NodeCompressorDecompressor(CompressorDecompressorBase):
         self.comp_ratio = comp_ratio
         self.step = step
         self.enable_vcr = enable_vcr
+        print('casting class', feature_dim, comp_ratio, enable_vcr)
         for i, f in enumerate(feature_dim):
             self.scorer[f"layer_{i}"] = nn.Sequential(
                 nn.Linear(f, 1),
@@ -389,6 +397,7 @@ class NodeCompressorDecompressor(CompressorDecompressorBase):
             k = val.shape[0] // comp_ratio
             # Send at least 1 node if CR is too high for compatiability
             k = max(1, k)
+            print('in for', val, score, k)
             new_val, idx = pool(val, score, k)
             compressed_tensors_l.append(new_val)
             sel_indices.append(idx)

@@ -195,7 +195,7 @@ def initialize_comms(_rank: int, _world_size: int, master_ip_address: str,
     os.environ['I_MPI_COMM_WORLD'] = str(_world_size)
     os.environ['I_MPI_COMM_RANK'] = str(_rank)
     dist.init_process_group(
-        backend=backend, rank=_rank, world_size=_world_size,timeout = timedelta(seconds=180))
+        backend=backend, rank=_rank, world_size=_world_size,timeout = timedelta(seconds=600))
 
     _CommData.rank = _rank
     _CommData.world_size = _world_size

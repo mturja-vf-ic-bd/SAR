@@ -59,10 +59,10 @@ parser.add_argument(
     help="Run on CPUs if set, otherwise run on GPUs "
 )
 
-# parser.add_argument(
-#     "--disable-cut-edges", action="store_false",
-#     help="Disable Communication "
-# )
+parser.add_argument(
+    "--disable-cut-edges", action="store_true",
+    help="If present, disables communication "
+)
 
 parser.add_argument('--train-iters', default=100, type=int,
                     help='number of training iterations ')
@@ -95,6 +95,23 @@ parser.add_argument(
     help=" Form of graph partition. "
 )
 
+
+parser.add_argument(
+    "--conv",
+    type=str,
+    default="sage",
+    choices=['sage', 'gcn'],
+    help=" Form of graph convolution. "
+)
+
+parser.add_argument('--num-layers', default=3, type=int,
+                    help='Number of layers ')
+
+parser.add_argument(
+    "--batch-norm", action="store_true",
+    help="If present, adds batch normalization.  "
+)
+
 parser.add_argument(
     "--dataset-name",
     type=str,
@@ -104,32 +121,56 @@ parser.add_argument(
 )
 
 class GNNModel(nn.Module):
-    def __init__(self,  in_dim: int, hidden_dim: int, out_dim: int):
-        super().__init__()
+    def __init__(self,  in_channels: int, hidden_channels: int, out_channels: int, batch_norm: bool, conv: str, num_layers:int):
+        super(GNNModel, self).__init__()
 
-        self.convs = nn.ModuleList([
-            # pylint: disable=no-member
-            dgl.nn.SAGEConv(in_dim, hidden_dim, aggregator_type='mean'),
-            # pylint: disable=no-member
-            dgl.nn.SAGEConv(hidden_dim, hidden_dim, aggregator_type='mean'),
-            # pylint: disable=no-member
-            dgl.nn.SAGEConv(hidden_dim, out_dim, aggregator_type='mean'),
-        ])
-        self.top = nn.Sequential(
-                                nn.BatchNorm1d(hidden_dim),
-                                # nn.ReLU(),
-                                nn.Dropout(0.5),
-        )
+        self.dropout = 0.5
+        self.convs = torch.nn.ModuleList()
+        self.batch_norm = batch_norm
+        self.num_layers = num_layers
 
-    
-    def forward(self,  graph: sar.GraphShardManager, features: torch.Tensor):
-        for idx, conv in enumerate(self.convs):
-            features = conv(graph, features)
-            if idx < len(self.convs) - 1:
-                features = self.top(features)
-            features = F.relu(features, inplace=True)
-            
-        return features
+        assert conv in ['gcn', 'sage']
+        if conv == 'gcn':
+            conv_fun = dgl.nn.GraphConv
+            conv_config = {}
+        elif conv == 'sage':
+            conv_fun = dgl.nn.SAGEConv
+            conv_config = {'aggregator_type': 'mean'}
+
+
+        self.convs.append(conv_fun(in_channels, hidden_channels, **conv_config ))
+
+        if self.batch_norm:
+            self.bns = torch.nn.ModuleList()
+            self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+            for _ in range(num_layers - 2):
+                self.bns.append(torch.nn.BatchNorm1d(hidden_channels))   
+
+        for _ in range(self.num_layers - 2):
+            self.convs.append(
+                conv_fun(hidden_channels, hidden_channels, **conv_config))
+            # self.bns.append(torch.nn.BatchNorm1d(hidden_channels))
+        self.convs.append(conv_fun(hidden_channels, out_channels, **conv_config))
+
+
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+        if self.batch_norm:
+            for bn in self.bns:
+                bn.reset_parameters()
+
+    def forward(self, adj_t, x):
+        for i, conv in enumerate(self.convs[:-1]):
+            x = conv(adj_t, x)
+            if self.batch_norm:
+                x = self.bns[i](x)
+            x = F.relu(x)
+            # x = F.dropout(x, p=self.dropout, training=self.training)
+        # if self.batch_norm:
+
+        x = self.convs[-1](adj_t, x)
+        return x.log_softmax(dim=-1)
 
 
 def main():
@@ -154,6 +195,7 @@ def main():
 
     use_gpu = torch.cuda.is_available() and not args.cpu_run
     device = torch.device('cuda' if use_gpu else 'cpu')
+
 
     # Obtain the ip address of the master through the network file system
     master_ip_address = sar.nfs_ip_init(args.rank, args.ip_file)
@@ -198,7 +240,10 @@ def main():
     
     gnn_model = GNNModel(features.size(1),
                          args.hidden_layer_dim,
-                         num_labels).to(device)
+                         num_labels, 
+                         args.batch_norm, 
+                         args.conv, 
+                         args.num_layers).to(device)
     print('model', gnn_model)
 
     # Synchronize the model parmeters across all workers
