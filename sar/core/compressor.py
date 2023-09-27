@@ -131,6 +131,8 @@ class FeatureCompressorDecompressor(CompressorDecompressorBase):
         self.feature_dim = feature_dim
         self.compressors = nn.ModuleDict()
         self.decompressors = nn.ModuleDict()
+        self.k = [floor(f/comp_ratio[Config.current_layer_index]) for i, f in enumerate(feature_dim)]
+        self.total = [128, 256]
         for i, f in enumerate(feature_dim):
             k = floor(f/comp_ratio[Config.current_layer_index])
             k = max(1, k)
@@ -142,6 +144,26 @@ class FeatureCompressorDecompressor(CompressorDecompressorBase):
                 nn.Linear(k, f)
             )
 
+    # def compress(self, tensors_l: List[Tensor], iter: int = 0, scorer_type=None):
+    #     '''
+    #     Take a list of tensors and return a list of compressed tensors
+
+    #     :param iter: Ignore. Added for compatiability.
+    #     :param enable_vcr: Ignore. Added for compatiability.
+    #     :param scorer_type: Ignore, Added for compatiability.
+    #     '''
+    #     # Send data to each client using same compression module
+    #     logger.debug(
+    #         f"index: {Config.current_layer_index}, tensor_sz: {tensors_l[0].shape}")
+    #     tensors_l = [self.compressors[f"layer_{Config.current_layer_index}"](val)
+    #                  if Config.current_layer_index < Config.total_layers - 1
+    #                  else val for val in tensors_l]
+    
+    #     for e in tensors_l:
+    #         print('send',e.shape)
+    #     return tensors_l
+
+    
     def compress(self, tensors_l: List[Tensor], iter: int = 0, scorer_type=None):
         '''
         Take a list of tensors and return a list of compressed tensors
@@ -153,20 +175,47 @@ class FeatureCompressorDecompressor(CompressorDecompressorBase):
         # Send data to each client using same compression module
         logger.debug(
             f"index: {Config.current_layer_index}, tensor_sz: {tensors_l[0].shape}")
-        tensors_l = [self.compressors[f"layer_{Config.current_layer_index}"](val)
+        # tensors_l = [self.compressors[f"layer_{Config.current_layer_index}"](val)
+        #              if Config.current_layer_index < Config.total_layers - 1
+        #              else val for val in tensors_l]
+        tensors_l = [val[:, :self.k[Config.current_layer_index]].contiguous()
                      if Config.current_layer_index < Config.total_layers - 1
-                     else val for val in tensors_l]
-        return tensors_l
+                     else val for val in tensors_l]    
 
+        return tensors_l
+    
+    #     # Send data to each client using same compression module
+    #     logger.debug(
+    #         f"index: {Config.current_layer_index}, tensor_sz: {tensors_l[0].shape}")
+    #     tensors_l = [val[:, :self.k[i]].contiguous()
+    #                  if Config.current_layer_index < Config.total_layers - 1
+    #                  else val for i, val in enumerate(tensors_l)]
+    #     for e in tensors_l:
+    #         print(e.shape)
+    #     return tensors_l
     def decompress(self, channel_feat: List[Tensor]):
         '''
         Take a list of compressed tensors and return a list of decompressed tensors
         '''
-        decompressed_tensors = [self.decompressors[f"layer_{Config.current_layer_index}"](c)
+        # decompressed_tensors = [self.decompressors[f"layer_{Config.current_layer_index}"](c)
+        #                         if Config.current_layer_index < Config.total_layers - 1
+        #                         else c for c in channel_feat]
+        decompressed_tensors = [F.pad(
+                                c, (0, self.total[Config.current_layer_index] - self.k[Config.current_layer_index]))
                                 if Config.current_layer_index < Config.total_layers - 1
-                                else c for c in channel_feat]
+                                else c for i,c in enumerate(channel_feat)]
         return decompressed_tensors
-
+    
+    # def decompress(self, channel_feat: List[Tensor]):
+    #     '''
+    #     Take a list of compressed tensors and return a list of decompressed tensors
+    #     '''
+    #     for c in channel_feat:
+    #         print('receive', c.shape, len(channel_feat))
+    #     decompressed_tensors = [self.decompressors[f"layer_{Config.current_layer_index}"](c)
+    #                             if Config.current_layer_index < Config.total_layers - 1
+    #                             else c for c in channel_feat]
+    #     return decompressed_tensors
 
 class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
     def __init__(self, feature_dim: List[int], slope: int, max_comp_ratio: float, min_comp_ratio: float):
@@ -241,15 +290,19 @@ class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
         # Send data to each client using same compression module
         logger.debug(
             f"index: {Config.current_layer_index}, tensor_sz: {tensors_l[0].shape}")
-        active_compressor = self.compressors[f"layer_{Config.current_layer_index}"]
-        active_feature_dim = active_compressor[0].weight.size(0)
+        # active_compressor = self.compressors[f"layer_{Config.current_layer_index}"]
+        # active_feature_dim = active_compressor[0].weight.size(0)
         compressed_feature_dim = self.get_compressed_size(iter)
 
         result_l = []
         for val in tensors_l:
             if Config.current_layer_index < Config.total_layers - 1:
-                res = active_compressor(val)
-                res = res[:, :compressed_feature_dim].contiguous()
+                # res = active_compressor(val)
+                # print('No Compressing')
+                # res = val.detach().clone()
+                # res = res[:, :compressed_feature_dim].contiguous()
+                res = val[:, :compressed_feature_dim].contiguous()
+
             else:
                 res = val
             result_l.append(res)
@@ -267,10 +320,13 @@ class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
         for val in channel_feat:
             if Config.current_layer_index < Config.total_layers - 1:
                 compressed_feature_dim = val.size(-1)
+                print('decompressed', compressed_feature_dim)
+
                 val = F.pad(
                     val, (0, active_feature_dim - compressed_feature_dim))
-
-                res = active_decompressor(val)
+                # Juan Commented this
+                # res = active_decompressor(val)
+                res = val
             else:
                 res = val
             result_l.append(res)
