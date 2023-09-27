@@ -41,6 +41,77 @@ class CompressorDecompressorBase(nn.Module):
         return channel_feat
 
 
+class DropoutCompressorDecompressor(CompressorDecompressorBase):
+    def __init__(self, feature_dim: List[int], comp_ratio: List[float]):
+        """
+        """
+
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.compressors = {}
+        self.decompressors = {}
+        for i, f in enumerate(feature_dim):
+            k = floor(f/comp_ratio[Config.current_layer_index])
+            k = max(1, k)
+            print(i, k, f, comp_ratio[Config.current_layer_index])
+            self.compressors[f"layer_{i}"] = k
+            self.decompressors[f"layer_{i}"] = f
+
+        self.compress_seed = self.decompress_seed = 0
+
+    def compress(self, tensors_l: List[Tensor], iter: int = 0, scorer_type=None):
+        '''
+        Take a list of tensors and return a list of compressed tensors
+
+        :param iter: Ignore. Added for compatiability.
+        :param enable_vcr: Ignore. Added for compatiability.
+        :param scorer_type: Ignore, Added for compatiability.
+        '''
+        # Send data to each client using same compression module
+        logger.debug(
+            f"index: {Config.current_layer_index}, tensor_sz: {tensors_l[0].shape}")
+
+        result_tensors = []
+        if Config.current_layer_index < Config.total_layers - 1:
+            k = self.compressors[f"layer_{Config.current_layer_index}"]
+            for tens in tensors_l:
+                torch.manual_seed(self.compress_seed)
+                perm = torch.randperm(tens.size(1))[:k]
+                print('send perm', self.compress_seed, perm)
+                result_tensors.append(tens[:, perm])
+        else:
+            result_tensors = tensors_l
+
+        print(f'sending {[x.size() for x in result_tensors]}')
+        self.compress_seed += 1
+        return result_tensors
+
+    def decompress(self, channel_feat: List[Tensor]):
+        '''
+        Take a list of compressed tensors and return a list of decompressed tensors
+        '''
+        result_tensors = []
+        if Config.current_layer_index < Config.total_layers - 1:
+            k = self.compressors[f"layer_{Config.current_layer_index}"]
+            f = self.decompressors[f"layer_{Config.current_layer_index}"]
+            for tens in channel_feat:
+                res = tens.new(tens.size(0), f).zero_()
+                print(tens.size(), k)
+                assert tens.size(1) == k
+                assert res.size(1) == f
+                torch.manual_seed(self.decompress_seed)
+                perm = torch.randperm(f)[:k]
+                print('recv perm', self.decompress_seed, perm)
+                res[:, perm] = tens
+#                res = res * f / k  # Scaling factor as in dropout
+                result_tensors.append(res)
+        else:
+            result_tensors = channel_feat
+
+        self.decompress_seed += 1
+        return result_tensors
+
+
 class FeatureCompressorDecompressor(CompressorDecompressorBase):
     def __init__(self, feature_dim: List[int], comp_ratio: List[float]):
         """
@@ -62,10 +133,10 @@ class FeatureCompressorDecompressor(CompressorDecompressorBase):
         self.decompressors = nn.ModuleDict()
         for i, f in enumerate(feature_dim):
             k = floor(f/comp_ratio[Config.current_layer_index])
+            k = max(1, k)
             print(i, k, f, comp_ratio[Config.current_layer_index])
             self.compressors[f"layer_{i}"] = nn.Sequential(
-                nn.Linear(f, k),
-                nn.ReLU()
+                nn.Linear(f, k)
             )
             self.decompressors[f"layer_{i}"] = nn.Sequential(
                 nn.Linear(k, f)
@@ -98,7 +169,7 @@ class FeatureCompressorDecompressor(CompressorDecompressorBase):
 
 
 class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
-    def __init__(self, feature_dim: List[int], slope: int,max_comp_ratio: float, min_comp_ratio: float):
+    def __init__(self, feature_dim: List[int], slope: int, max_comp_ratio: float, min_comp_ratio: float):
         """
         A feature-based compression decompression module. The compressor compresses outgoing
         tensor along feature dimension and decompresses it back to original size on the receiving
@@ -119,8 +190,6 @@ class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
         self.slope = slope
         self.min_comp_ratio = min_comp_ratio
         self.max_comp_ratio = max_comp_ratio
-        
-
 
         for i, f in enumerate(feature_dim):
             Config.current_layer_index = i
@@ -158,7 +227,7 @@ class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
         else:
             compressed_feature_dim = active_feature_dim
         print(
-            f'compressed feature dim at layer {Config.current_layer_index} : {compressed_feature_dim}', 'iter',iter,current_ratio) #juan added this
+            f'compressed feature dim at layer {Config.current_layer_index} : {compressed_feature_dim}', 'iter', iter, current_ratio)  # juan added this
         return compressed_feature_dim
 
     def compress(self, tensors_l: List[Tensor], iter: int = 0, scorer_type=None):
@@ -205,6 +274,110 @@ class VariableFeatureCompressorDecompressor(CompressorDecompressorBase):
             else:
                 res = val
             result_l.append(res)
+        return result_l
+
+
+class VariableDropoutCompressorDecompressor(CompressorDecompressorBase):
+    def __init__(self, feature_dim: List[int], slope: int, max_comp_ratio: float, min_comp_ratio: float):
+        """
+        A feature-based compression decompression module. The compressor compresses outgoing
+        tensor along feature dimension and decompresses it back to original size on the receiving
+        client side. The model follows a autoencoder like architecture where sending client uses the
+        encoder and receiving client uses the decoder.
+
+        :param feature_dim: A list of feature dimension for each layer of GNN including input layer.
+        :type feature_dim: List[int]
+        :param comp_ratio: A list of compression ratio for each layer of GNN to allow different
+        compression ratio for different layers.
+        :type comp_ratio: List[float]
+        """
+
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.compressors = {}
+        self.decompressors = {}
+        self.slope = slope
+        self.min_comp_ratio = min_comp_ratio
+        self.max_comp_ratio = max_comp_ratio
+        self.compress_seed = self.decompress_seed = 0
+
+        for i, f in enumerate(feature_dim):
+            Config.current_layer_index = i
+            self.decompressors[f"layer_{i}"] = f
+            self.compressors[f"layer_{i}"] = self.get_compressed_size(0)
+
+    def get_compressed_size(self, iter):
+
+        slope = (self.max_comp_ratio - self.min_comp_ratio) / \
+            (Config.total_train_iter-2)
+        # current_ratio = self.max_comp_ratio - iter * slope
+        current_ratio = self.max_comp_ratio - self.slope * iter * slope
+
+#        current_ratio = self.max_comp_ratio * math.exp(-(iter * math.log(
+#            self.max_comp_ratio/self.min_comp_ratio))/(Config.total_train_iter - 2))
+
+        current_ratio = max(current_ratio, self.min_comp_ratio)
+
+        active_feature_dim = self.decompressors[f"layer_{Config.current_layer_index}"]
+
+        if Config.current_layer_index < Config.total_layers - 1:
+            compressed_feature_dim = int(
+                active_feature_dim * 1.0 / current_ratio)
+
+        else:
+            compressed_feature_dim = active_feature_dim
+        print(
+            f'compressed feature dim at layer {Config.current_layer_index} : {compressed_feature_dim}', 'iter', iter, current_ratio)  # juan added this
+        return compressed_feature_dim
+
+    def compress(self, tensors_l: List[Tensor], iter: int = 0, scorer_type=None):
+        '''
+        Take a list of tensors and return a list of compressed tensors
+
+        :param iter: Ignore. Added for compatiability.
+        :param enable_vcr: Ignore. Added for compatiability.
+        :param scorer_type: Ignore, Added for compatiability.
+        '''
+        # Send data to each client using same compression module
+        logger.debug(
+            f"index: {Config.current_layer_index}, tensor_sz: {tensors_l[0].shape}")
+
+        active_feature_dim = self.decompressors[f"layer_{Config.current_layer_index}"]
+        compressed_feature_dim = self.get_compressed_size(iter)
+
+        result_l = []
+        for val in tensors_l:
+            if Config.current_layer_index < Config.total_layers - 1:
+                torch.manual_seed(self.compress_seed)
+                perm = torch.randperm(val.size(1))[:compressed_feature_dim]
+                res = val[:, perm]
+            else:
+                res = val
+            result_l.append(res)
+
+        self.compress_seed += 1
+        return result_l
+
+    def decompress(self, channel_feat: List[Tensor]):
+        '''
+        Take a list of compressed tensors and return a list of decompressed tensors
+        '''
+
+        active_feature_dim = self.decompressors[f"layer_{Config.current_layer_index}"]
+
+        result_l = []
+        for val in channel_feat:
+            if Config.current_layer_index < Config.total_layers - 1:
+                compressed_feature_dim = val.size(-1)
+                res = val.new(val.size(0), active_feature_dim).zero_()
+                torch.manual_seed(self.decompress_seed)
+                perm = torch.randperm(active_feature_dim)[:compressed_feature_dim]
+                res[:, perm] = val
+            else:
+                res = val
+            result_l.append(res)
+
+        self.decompress_seed += 1
         return result_l
 
 

@@ -33,8 +33,10 @@ from datetime import datetime
 import json
 
 import sar
+from sar.custom_partitioning import load_custom_partitioning
+
 from sar.core.compressor import \
-    FeatureCompressorDecompressor, NodeCompressorDecompressor, SubgraphCompressorDecompressor, VariableFeatureCompressorDecompressor, PCACompressorDecompressor
+    FeatureCompressorDecompressor, NodeCompressorDecompressor, SubgraphCompressorDecompressor, VariableFeatureCompressorDecompressor, PCACompressorDecompressor, DropoutCompressorDecompressor, VariableDropoutCompressorDecompressor
 from sar.config import Config
 
 
@@ -70,6 +72,19 @@ parser.add_argument(
     help=" Form of graph partition. "
 )
 
+parser.add_argument(
+    "--use-custom-partitions", action="store_true",
+    help=" "
+)
+
+parser.add_argument(
+    "--custom-partitioning-dir",
+    type=str,
+    default="",
+    help=" "
+)
+
+
 parser.add_argument('--ip-file', default='./ip_file', type=str,
                     help='File with ip-address. Worker 0 creates this file and all others read it ')
 
@@ -81,7 +96,7 @@ parser.add_argument('--log-level', default='INFO', type=str,
                     help='SAR log level ')
 
 
-parser.add_argument('--backend', default='ccl', type=str, choices=['ccl', 'nccl', 'mpi'],
+parser.add_argument('--backend', default='ccl', type=str, choices=['ccl', 'nccl', 'mpi', 'gloo'],
                     help='Communication backend to use ')
 
 parser.add_argument(
@@ -162,11 +177,12 @@ parser.add_argument('--comp_ratio', default=None, type=int,
 parser.add_argument('--min_comp_ratio', default=None, type=float,
                     help="min Compression ratio for variable feature-based compression")
 
-parser.add_argument('--max_comp_ratio', default=None, type=int,
+parser.add_argument('--max_comp_ratio', default=None, type=float,
                     help="max Compression ratio for variable feature-based compression")
 
 parser.add_argument('--compression_type', default="feature", type=str,
-                    choices=["feature", "node", "subgraph", "variable", "pca"],
+                    choices=["feature", "node", "subgraph", "variable",
+                             "pca", "dropout", "variable_dropout"],
                     help="Choose among three possible compression types")
 
 parser.add_argument('--enable_vcr', action='store_true',
@@ -178,6 +194,7 @@ parser.add_argument('--compression_step', default=None, type=int,
 
 parser.add_argument('--variable_compression_slope', default=1, type=int,
                     help="Slope of the linear compression")
+
 
 class GNNModel(nn.Module):
     def __init__(self,  gnn_layer: str, n_layers: int, layer_dim: int,
@@ -204,7 +221,7 @@ class GNNModel(nn.Module):
             else:
                 raise ValueError(f'unknown gnn layer type {gnn_layer}')
             self.convs.append(layer)
-        #self.dropout = nn.Dropout(0.5)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, blocks: List[Union[sar.GraphShardManager, sar.DistributedBlock]],
                 features: torch.Tensor):
@@ -221,7 +238,7 @@ class GNNModel(nn.Module):
             if idx < len(self.convs) - 1:
                 features = F.relu(features, inplace=True)
                 #features = self.dropout(features)
-
+                features = self.dropout(features)
         return features
 
 
@@ -236,6 +253,8 @@ def infer_pass(gnn_model: torch.nn.Module,
     # a subset of the the nodes in the partition. Use the input_nodes member of
     # sar.GraphShardManager or sar.DistributedBlock to obtain the indices of the
     # input nodes to the first block and provide only the features of these nodes as input
+    old_enable_cr = Config.enable_cr
+    Config.enable_cr = False
     if mfg_blocks:
         features = features[eval_blocks[0].input_nodes]
     gnn_model.eval()
@@ -280,6 +299,7 @@ def infer_pass(gnn_model: torch.nn.Module,
     # Sum the loss, n_correct, and number of mask elements across all workers
     sar.comm.all_reduce(loss_acc_vec, op=dist.ReduceOp.SUM,
                         move_to_comm_device=True)
+    Config.enable_cr = old_enable_cr
 
     (train_loss, train_acc, val_loss, val_acc, test_loss, test_acc) = \
         (loss_acc_vec[0] / loss_acc_vec[2],
@@ -314,7 +334,6 @@ def train_pass(gnn_model: torch.nn.Module,
     gnn_model.train()
     t1 = time.time()
     logits = gnn_model(train_blocks, features)
-    Config.comm_time_forward = time.time() - t1
     # print('forward time ', Config.comm_time_forward, flush=True)
 
     if mfg_blocks:
@@ -332,10 +351,7 @@ def train_pass(gnn_model: torch.nn.Module,
 
 #    print('pre backward grads', pre_comp_grads)
 
-    t1 = time.time()
     loss.backward()
-    Config.comm_time_backward = time.time() - t1
-    # print('backward time ', Config.comm_time_backward, flush=True)
     # Do not forget to gather the parameter gradients from all workers
     t1 = time.time()
     if (train_iter_idx + 1) % fed_agg_round == 0:
@@ -352,11 +368,81 @@ def train_pass(gnn_model: torch.nn.Module,
     optimizer.step()
 
 
+def load_random_partitions(partition_dir, rank, n_parts):
+    active_type_data = {}
+
+    for name in ['features', 'labels', 'train_indices', 'val_indices', 'test_indices']:
+        active_type_data[name] = (
+            (None, os.path.join(partition_dir, f'{name}.npy'),),)
+
+    partition_data_random = load_custom_partitioning(partition_dir, rank, n_parts,
+                                                     active_type_data)
+
+    features = partition_data_random.node_features['features']
+    labels = partition_data_random.node_features['labels']
+    labels[torch.isnan(labels)] = -1
+    labels = labels.long()
+
+    num_labels = labels.max() + 1
+    sar.comm.all_reduce(num_labels, dist.ReduceOp.MAX,
+                        move_to_comm_device=True)
+    num_labels = num_labels.item()
+
+    masks = {}
+    masks['train_indices'] = partition_data_random.node_features['train_indices'].nonzero().view(-1)
+    masks['val_indices'] = partition_data_random.node_features['val_indices'].nonzero().view(-1)
+    masks['test_indices'] = partition_data_random.node_features['test_indices'].nonzero().view(-1)
+
+    return partition_data_random, features, labels, masks, num_labels
+
+
+def load_dgl_partitions(json_file, rank, device):
+    # Load DGL partition data
+    partition_data = sar.load_dgl_partition_data(
+        json_file, rank, False, device)
+
+    # Obtain train,validation, and test masks
+    # These are stored as node features. Partitioning may prepend
+    # the node type to the mask names. So we use the convenience function
+    # suffix_key_lookup to look up the mask name while ignoring the
+    # arbitrary node type
+    # The train/val/test masks are only defined for nodes with type 'paper'.
+    # We set the ``expand_to_all`` flag  to expand the mask to all nodes in the
+    # graph (mask will be filled with zeros). We use the expand_all option when
+    # loading other node-type specific tensors such as features and labels
+
+    masks = {}
+    for mask_name, indices_name in zip(['train_mask', 'val_mask', 'test_mask'],
+                                       ['train_indices', 'val_indices', 'test_indices']):
+        boolean_mask = sar.suffix_key_lookup(partition_data.node_features,
+                                             mask_name)
+        masks[indices_name] = boolean_mask.nonzero(
+            as_tuple=False).view(-1).to(device)
+
+    labels = sar.suffix_key_lookup(partition_data.node_features,
+                                   'labels')
+    labels[torch.isnan(labels)] = -1
+    labels = labels.long()
+
+    # Obtain the number of classes by finding the max label across all workers
+    num_labels = labels.max() + 1
+    sar.comm.all_reduce(num_labels, dist.ReduceOp.MAX,
+                        move_to_comm_device=True)
+    num_labels = num_labels.item()
+
+    features = sar.suffix_key_lookup(partition_data.node_features,
+                                     'features')
+
+    return partition_data, features, labels, masks, num_labels
+
+
 def main():
     args = parser.parse_args()
     print('args', args)
-    args.output_dir = os.path.join(args.output_dir, args.compression_type) # Folder with Compression type
-    args.output_dir = os.path.join(args.output_dir ,'world_size_' + str(args.world_size) + 'compression_' + args.compression_type + datetime.now().strftime("%Y-%m%d-%H%M%S") )
+    # Folder with Compression type
+    args.output_dir = os.path.join(args.output_dir, args.compression_type)
+    args.output_dir = os.path.join(args.output_dir, 'world_size_' + str(args.world_size) +
+                                   'compression_' + args.compression_type + datetime.now().strftime("%Y-%m%d-%H%M%S"))
     os.makedirs(os.path.join(args.output_dir), exist_ok=True)
 
     # Save the dict
@@ -414,39 +500,22 @@ def main():
     # Load DGL partition data
     # partitioning_json_file = os.path.join('partition_data','ogbn-arxiv',str(args.world_size),args.partitioning_json_file)
     # partitioning_json_file = os.path.join('partition_data',args.part_method,args.dataset_name,str(args.partitions),args.partitioning_json_file)
-    partitioning_json_file = os.path.join('partition_data',args.part_method,args.dataset_name,str(args.partitions),args.partitioning_json_file)
-
+    partitioning_json_file = args.partitioning_json_file
 
     # partition_data = sar.load_dgl_partition_data(
     #     partitioning_json_file, args.rank, device)
 
-    partition_data = sar.load_dgl_partition_data(
-        partitioning_json_file, args.rank, args.disable_cut_edges, device)
+    if args.use_custom_partitions:
+        partition_data, features, labels, masks, num_labels = load_random_partitions(
+            args.custom_partitioning_dir, args.rank, args.world_size)
+    else:
+        partition_data, features, labels, masks, num_labels = load_dgl_partitions(
+            args.partitioning_json_file, args.rank, device)
 
-    # Obtain train,validation, and test masks
-    # These are stored as node features. Partitioning may prepend
-    # the node type to the mask names. So we use the convenience function
-    # suffix_key_lookup to look up the mask name while ignoring the
-    # arbitrary node type
-    masks = {}
-    for mask_name, indices_name in zip(['train_mask', 'val_mask', 'test_mask'],
-                                       ['train_indices', 'val_indices', 'test_indices']):
-        boolean_mask = sar.suffix_key_lookup(partition_data.node_features,
-                                             mask_name)
-        masks[indices_name] = boolean_mask.nonzero(
-            as_tuple=False).view(-1).to(device)
-
-    labels = sar.suffix_key_lookup(partition_data.node_features,
-                                   'labels').long().to(device)
-
-    # Obtain the number of classes by finding the max label across all workers
-    num_labels = labels.max() + 1
-    sar.comm.all_reduce(num_labels, dist.ReduceOp.MAX,
-                        move_to_comm_device=True)
-    num_labels = num_labels.item()
-
-    features = sar.suffix_key_lookup(
-        partition_data.node_features, 'features').to(device)
+    if args.disable_cut_edges:
+        for shard_edge in partition_data.all_shard_edges:
+            shard_edge.edges[0].resize_(0)
+            shard_edge.edges[1].resize_(0)
 
     if args.construct_mfgs:
         # sar.construct_mfgs needs the global indices of the seed nodes.
@@ -488,12 +557,27 @@ def main():
             full_graph_manager = full_graph_manager.get_full_partition_graph()
             feature_dim = [features.size(
                 1)] + [args.layer_dim] * (args.n_layers - 2) + [num_labels]
+            print(
+                f'feature dim at worker {args.rank} : {feature_dim}', flush=True)
             if args.compression_type == "feature":
                 print('entered here')
                 comp_mod = FeatureCompressorDecompressor(
                     feature_dim=feature_dim,
                     comp_ratio=[float(args.comp_ratio)] * args.n_layers
                 )
+            elif args.compression_type == "dropout":
+                comp_mod = DropoutCompressorDecompressor(
+                    feature_dim=feature_dim,
+                    comp_ratio=[float(args.comp_ratio)] * args.n_layers
+                )
+            elif args.compression_type == "variable_dropout":
+                comp_mod = VariableDropoutCompressorDecompressor(
+                    feature_dim=feature_dim,
+                    slope=args.variable_compression_slope,
+                    min_comp_ratio=args.min_comp_ratio,
+                    max_comp_ratio=args.max_comp_ratio
+                )
+
             elif args.compression_type == "variable":
                 comp_mod = VariableFeatureCompressorDecompressor(
                     feature_dim=feature_dim,
@@ -552,6 +636,12 @@ def main():
                          args.layer_dim,
                          input_feature_dim=features.size(1),
                          n_classes=num_labels).to(device)
+    # if args.rank == 0:
+    #     if os.path.exists('gnn_debug_model'):
+    #         gnn_model.load_state_dict(torch.load('gnn_debug_model'))
+    #     else:
+    #         torch.save(gnn_model.state_dict(), 'gnn_debug_model')
+
     if args.train_compressor:
         gnn_model.compressor_decompressor = full_graph_manager._compression_decompression
     print('model', gnn_model)
@@ -641,6 +731,7 @@ def main():
         with open(os.path.join(args.output_dir, 'loss.txt'), 'a') as f:
             f.write(result_message+'\n')
             f.close()
+
 
 if __name__ == '__main__':
     main()
