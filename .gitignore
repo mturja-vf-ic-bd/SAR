@@ -1,0 +1,6 @@
+*.sh
+datasets/
+*ip_file*
+*__pycache__
+.vscode*
+
